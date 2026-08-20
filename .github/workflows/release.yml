@@ -1,0 +1,65 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: test
+        run: go test ./...
+
+      - name: build all platforms
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          commit=$(git rev-parse HEAD)
+          date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          ldflags="-s -w \
+            -X github.com/ggeorgeazevedo/threatdiff/internal/version.Version=${VERSION} \
+            -X github.com/ggeorgeazevedo/threatdiff/internal/version.Commit=${commit} \
+            -X github.com/ggeorgeazevedo/threatdiff/internal/version.Date=${date}"
+
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            os=${target%/*}; arch=${target#*/}
+            out="dist/threatdiff_${VERSION}_${os}_${arch}"
+            bin="threatdiff"
+            [ "$os" = "windows" ] && bin="threatdiff.exe"
+            # CGO off keeps the binary static, which is what CI images need.
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch \
+              go build -trimpath -ldflags "$ldflags" -o "${out}/${bin}" ./cmd/threatdiff
+            cp LICENSE README.md "${out}/"
+            if [ "$os" = "windows" ]; then
+              (cd dist && zip -qr "$(basename "$out").zip" "$(basename "$out")")
+            else
+              (cd dist && tar czf "$(basename "$out").tar.gz" "$(basename "$out")")
+            fi
+            rm -rf "$out"
+          done
+
+          (cd dist && sha256sum ./* > checksums.txt)
+          cat dist/checksums.txt
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            dist/*

@@ -1,0 +1,200 @@
+name: threatdiff
+description: Turn a pull request diff into a threat model - findings, a risk score, a review checklist and SARIF.
+author: threatdiff contributors
+
+branding:
+  icon: shield
+  color: purple
+
+inputs:
+  version:
+    description: >
+      Release tag to install (for example v0.3.0), or "source" to build from the
+      checked-out repository. Pin this: an action that installs "latest" is an
+      action whose behaviour changes without a diff.
+    required: false
+    default: source
+  base-ref:
+    description: Base ref to diff against. Defaults to the pull request base branch.
+    required: false
+    default: ""
+  head-ref:
+    description: Head ref to diff. Defaults to the checked-out commit.
+    required: false
+    default: ""
+  config:
+    description: Path to the threatdiff config file.
+    required: false
+    default: ""
+  rules:
+    description: Extra rule pack file or directory.
+    required: false
+    default: ""
+  baseline:
+    description: Baseline file of accepted findings.
+    required: false
+    default: ""
+  fail-on:
+    description: Fail the job when a finding at this severity or worse appears (critical|high|medium|low|info). Empty means never fail.
+    required: false
+    default: ""
+  fail-score:
+    description: Fail the job when the risk score reaches this value. 0 disables.
+    required: false
+    default: "0"
+  min-confidence:
+    description: Drop findings below this confidence (high|medium|low).
+    required: false
+    default: ""
+  comment:
+    description: Post or update a sticky review comment on the pull request.
+    required: false
+    default: "true"
+  sarif:
+    description: Produce a SARIF file for upload to code scanning.
+    required: false
+    default: "true"
+  sarif-file:
+    description: Where to write the SARIF file.
+    required: false
+    default: threatdiff.sarif
+  working-directory:
+    description: Directory to run in.
+    required: false
+    default: "."
+  github-token:
+    description: Token used to post the comment. Needs pull-requests:write.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  score:
+    description: Overall risk score, 0-100.
+    value: ${{ steps.scan.outputs.score }}
+  band:
+    description: Risk band (minimal|low|medium|high|critical).
+    value: ${{ steps.scan.outputs.band }}
+  findings:
+    description: Number of live findings.
+    value: ${{ steps.scan.outputs.findings }}
+  failed:
+    description: Whether the configured gate was triggered.
+    value: ${{ steps.scan.outputs.failed }}
+  sarif-file:
+    description: Path to the SARIF file, when produced.
+    value: ${{ steps.scan.outputs.sarif-file }}
+  markdown-file:
+    description: Path to the rendered Markdown report.
+    value: ${{ steps.scan.outputs.markdown-file }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: "1.22"
+        cache: false
+
+    - name: Install threatdiff
+      shell: bash
+      env:
+        TD_VERSION: ${{ inputs.version }}
+        TD_ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        mkdir -p "${RUNNER_TEMP}/threatdiff-bin"
+        if [ "${TD_VERSION}" = "source" ]; then
+          # Build the copy of threatdiff that lives next to this action.
+          # This is the reproducible path: what runs is what you can read.
+          ( cd "${TD_ACTION_PATH}" && go build -o "${RUNNER_TEMP}/threatdiff-bin/threatdiff" ./cmd/threatdiff )
+        else
+          GOBIN="${RUNNER_TEMP}/threatdiff-bin" \
+            go install "github.com/ggeorgeazevedo/threatdiff/cmd/threatdiff@${TD_VERSION}"
+        fi
+        echo "${RUNNER_TEMP}/threatdiff-bin" >> "$GITHUB_PATH"
+
+    - name: Run threatdiff
+      id: scan
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        TD_BASE: ${{ inputs.base-ref }}
+        TD_HEAD: ${{ inputs.head-ref }}
+        TD_CONFIG: ${{ inputs.config }}
+        TD_RULES: ${{ inputs.rules }}
+        TD_BASELINE: ${{ inputs.baseline }}
+        TD_FAIL_ON: ${{ inputs.fail-on }}
+        TD_FAIL_SCORE: ${{ inputs.fail-score }}
+        TD_MIN_CONF: ${{ inputs.min-confidence }}
+        TD_SARIF: ${{ inputs.sarif }}
+        TD_SARIF_FILE: ${{ inputs.sarif-file }}
+      run: |
+        set -uo pipefail
+
+        base="${TD_BASE}"
+        if [ -z "$base" ] && [ -n "${GITHUB_BASE_REF:-}" ]; then
+          # actions/checkout defaults to a shallow clone with no base branch,
+          # so the merge base does not exist locally until we fetch it.
+          git fetch --no-tags --prune --unshallow origin "${GITHUB_BASE_REF}" >/dev/null 2>&1 \
+            || git fetch --no-tags origin "${GITHUB_BASE_REF}" >/dev/null 2>&1 || true
+          base="origin/${GITHUB_BASE_REF}"
+        fi
+
+        args=(scan --no-color --format json --out threatdiff.json --markdown-out threatdiff.md
+              --github-output "$GITHUB_OUTPUT")
+        [ -n "$base" ]              && args+=(--base "$base")
+        [ -n "${TD_HEAD}" ]         && args+=(--head "${TD_HEAD}")
+        [ -n "${TD_CONFIG}" ]       && args+=(--config "${TD_CONFIG}")
+        [ -n "${TD_RULES}" ]        && args+=(--rules "${TD_RULES}")
+        [ -n "${TD_BASELINE}" ]     && args+=(--baseline "${TD_BASELINE}")
+        [ -n "${TD_FAIL_ON}" ]      && args+=(--fail-on "${TD_FAIL_ON}")
+        [ -n "${TD_MIN_CONF}" ]     && args+=(--min-confidence "${TD_MIN_CONF}")
+        [ "${TD_FAIL_SCORE}" != "0" ] && args+=(--fail-score "${TD_FAIL_SCORE}")
+        [ "${TD_SARIF}" = "true" ]  && args+=(--sarif-out "${TD_SARIF_FILE}")
+
+        threatdiff "${args[@]}"
+        code=$?
+        if [ "$code" -gt 1 ]; then
+          echo "::error::threatdiff could not run (exit $code)"
+          exit "$code"
+        fi
+
+        # score / band / findings / failed were written directly by threatdiff
+        # via --github-output, so no jq or python is needed here.
+        {
+          echo "markdown-file=threatdiff.md"
+          [ "${TD_SARIF}" = "true" ] && echo "sarif-file=${TD_SARIF_FILE}"
+        } >> "$GITHUB_OUTPUT"
+
+        # The job summary is where reviewers actually look first.
+        cat threatdiff.md >> "$GITHUB_STEP_SUMMARY"
+        exit 0
+
+    - name: Comment on the pull request
+      if: ${{ inputs.comment == 'true' && github.event_name == 'pull_request' }}
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR: ${{ github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        marker='<!-- threatdiff:report -->'
+        # Update the existing comment rather than adding one per push: a bot
+        # that appends is a bot that gets muted.
+        existing=$(gh api "repos/${REPO}/issues/${PR}/comments" --paginate \
+          --jq "map(select(.body | startswith(\"${marker}\"))) | .[0].id // empty" || true)
+        if [ -n "$existing" ]; then
+          gh api -X PATCH "repos/${REPO}/issues/comments/${existing}" -F body=@threatdiff.md >/dev/null
+        else
+          gh api -X POST "repos/${REPO}/issues/${PR}/comments" -F body=@threatdiff.md >/dev/null
+        fi
+
+    - name: Enforce the gate
+      if: ${{ steps.scan.outputs.failed == 'true' }}
+      shell: bash
+      run: |
+        echo "::error::threatdiff gate triggered (risk ${{ steps.scan.outputs.score }}, ${{ steps.scan.outputs.findings }} findings)"
+        exit 1

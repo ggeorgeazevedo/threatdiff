@@ -1,0 +1,244 @@
+version: 1
+name: supply-chain
+description: >
+  Changes to what your build pulls in and trusts.
+
+rules:
+  - id: supplychain.dependency-manifest-changed
+    title: Dependency manifest changed
+    category: supply-chain
+    severity: low
+    confidence: high
+    on: file
+    paths:
+      - "**/package.json"
+      - "**/requirements*.txt"
+      - "**/Pipfile"
+      - "**/pyproject.toml"
+      - "**/go.mod"
+      - "**/Cargo.toml"
+      - "**/Gemfile"
+      - "**/composer.json"
+      - "**/pom.xml"
+      - "**/build.gradle"
+      - "**/build.gradle.kts"
+      - "**/*.csproj"
+      - "**/mix.exs"
+    question: >
+      For each new direct dependency: who maintains it, how many downloads does
+      it have, and when was it last released?
+    guidance: |
+      The checks worth doing on a new direct dependency take about two minutes:
+      release cadence, number of maintainers, whether the repository linked from
+      the registry actually matches the published package, and whether the name is
+      one character away from something more popular.
+      Typosquatting and newly-transferred packages are the two patterns that
+      account for most registry incidents.
+    cwe: ["CWE-1357"]
+
+  - id: supplychain.lockfile-deleted
+    title: Lockfile deleted
+    category: supply-chain
+    severity: high
+    confidence: high
+    on: file
+    file_events: ["deleted"]
+    paths:
+      - "**/package-lock.json"
+      - "**/yarn.lock"
+      - "**/pnpm-lock.yaml"
+      - "**/poetry.lock"
+      - "**/Gemfile.lock"
+      - "**/Cargo.lock"
+      - "**/composer.lock"
+      - "**/go.sum"
+    question: >
+      What resolves your dependency versions now, and is the result reproducible?
+    guidance: |
+      Without a lockfile the build resolves at install time, so the artifact you
+      tested and the artifact you ship can contain different code. It also removes
+      the integrity hashes that detect a tampered registry response.
+      `go.sum` in particular is a checksum database, not a version list - deleting
+      it disables verification against the checksum transparency log.
+    cwe: ["CWE-1104"]
+
+  - id: supplychain.dependency-from-vcs-or-url
+    title: Dependency pulled from a URL, git ref or local path
+    category: supply-chain
+    severity: high
+    confidence: high
+    on: added
+    paths:
+      - "**/package.json"
+      - "**/requirements*.txt"
+      - "**/pyproject.toml"
+      - "**/Gemfile"
+      - "**/composer.json"
+      - "**/go.mod"
+      - "**/Cargo.toml"
+    patterns:
+      - '(?i)["'']?[\w@/.\-]+["'']?\s*[:=]\s*["''](git\+|github:|git://|https?://|file:|link:|npm:)'
+      - '(?i)^\s*-e\s+(git\+|https?://)'
+      - '(?i)(replace|=>)\s+[\w./\-]+\s+=>\s+\.\.?/'
+      - '(?i)source\s*=\s*["'']https?://'
+    question: >
+      Is this reference immutable, and who can change what it points at?
+    guidance: |
+      A dependency on a branch resolves to whatever that branch holds at install
+      time. Pin to a commit SHA at minimum. A dependency on a plain HTTP URL is
+      worse still - it is modifiable by anyone on the network path.
+      `replace` directives and local paths that work on a laptop frequently break
+      or silently resolve elsewhere in CI; check that the build is still
+      hermetic.
+    cwe: ["CWE-494"]
+
+  - id: supplychain.install-lifecycle-script
+    title: Package lifecycle script added
+    category: supply-chain
+    severity: high
+    confidence: high
+    on: added
+    paths:
+      - "**/package.json"
+      - "**/setup.py"
+      - "**/pyproject.toml"
+    patterns:
+      - '(?i)["''](preinstall|install|postinstall|prepare|prepublish|preuninstall)["'']\s*:'
+      - '(?i)cmdclass\s*=|class\s+\w*Install\w*\s*\(\s*install\s*\)'
+    question: >
+      What does this script do, and does it need to run on every developer
+      machine and every CI job?
+    guidance: |
+      Lifecycle scripts run automatically at install time with the user's
+      privileges, which is why they are the standard payload location in registry
+      attacks. Read the script, and consider whether the work can move to an
+      explicit build step instead.
+      Running installs with lifecycle scripts disabled (`npm ci --ignore-scripts`)
+      in CI is a cheap and effective mitigation for the dependency tree as a
+      whole.
+    cwe: ["CWE-829"]
+
+  - id: supplychain.registry-or-mirror-changed
+    title: Package registry, mirror or proxy changed
+    category: supply-chain
+    severity: high
+    confidence: high
+    on: added
+    paths:
+      - "**/.npmrc"
+      - "**/.yarnrc*"
+      - "**/pip.conf"
+      - "**/pip.ini"
+      - "**/.pypirc"
+      - "**/setup.cfg"
+      - "**/requirements*.txt"
+      - "**/pyproject.toml"
+      - "**/Cargo.toml"
+      - "**/*.gradle"
+      - "**/*.gradle.kts"
+      - "**/pom.xml"
+      - "**/Gemfile"
+      - "**/composer.json"
+      - "**/Dockerfile*"
+      - "**/*.env"
+      - "**/.env.*"
+      - ".github/workflows/**"
+      - "**/*.sh"
+      - "**/Makefile"
+      - "**/nuget.config"
+    patterns:
+      # A registry setting names a host. Requiring that keeps the rule off every
+      # line that happens to contain the word "repository".
+      - '(?i)\b(registry|index[_\-]url|extra[_\-]index[_\-]url|mirror[_\-]?url|GOPROXY|GOPRIVATE|GONOSUMDB|GONOSUMCHECK|GONOSUMDB)\s*[:=]\s*["'']?(https?://|[a-z0-9.\-]+\.[a-z]{2,}(/|:))'
+      - '(?i)\b(insecure|trusted-host|allow_?insecure)\s*[:=]\s*\S'
+      - '(?i)npm\s+config\s+set\s+registry'
+      - '(?i)(pip|npm|yarn|pnpm)[^\n]*--(index-url|extra-index-url|registry)\s'
+    exclude_patterns:
+      - '(?i)(registry\.npmjs\.org|pypi\.org/simple|proxy\.golang\.org|rubygems\.org|repo\.maven\.apache\.org|registry\.yarnpkg\.com|crates\.io)'
+    question: >
+      Who operates this registry, and does adding it let a public package shadow
+      an internal one?
+    guidance: |
+      Adding a second index without scoping it is the dependency-confusion
+      pattern: most clients will happily take the highest version from any
+      configured index, so an attacker who publishes `your-internal-lib 99.0.0`
+      publicly wins.
+      Scope internal packages to a namespace, configure the private registry as
+      the only source for that namespace, and never use `extra-index-url` for
+      internal packages.
+    cwe: ["CWE-427"]
+    references:
+      - "https://medium.com/@alex.birsan/dependency-confusion-4a5d60fec610"
+
+  - id: supplychain.base-image-unpinned
+    title: Container base image not pinned to a digest
+    category: supply-chain
+    severity: medium
+    confidence: high
+    on: added
+    languages: [dockerfile, yaml, compose]
+    patterns:
+      - '(?i)^\s*FROM\s+\S+:latest'
+      - '(?i)^\s*FROM\s+[^\s@]+\s*(AS\s+\w+)?\s*$'
+      - '(?i)image\s*:\s*\S+:latest'
+    exclude_patterns:
+      - '@sha256:'
+      - '(?i)^\s*FROM\s+(scratch|\$\{?[A-Z_]+)'
+    question: >
+      Which exact image will this build pull next month?
+    guidance: |
+      A tag is a moving pointer. Pinning to `image@sha256:...` makes the build
+      reproducible and means a rebuild cannot silently pick up a different
+      operating system. Keep the tag in a comment and let an automated updater
+      raise the digest, so pinning does not turn into never patching.
+    cwe: ["CWE-1357"]
+
+  - id: supplychain.integrity-check-weakened
+    title: Package integrity verification disabled
+    category: supply-chain
+    severity: high
+    confidence: high
+    on: added
+    patterns:
+      - '(?i)(--no-verify|--allow-unauthenticated|--force-yes|--no-check-certificate|GOFLAGS=.*-insecure|GONOSUMDB|GONOSUMCHECK|GOSUMDB\s*=\s*off|GOPRIVATE\s*=\s*\*)'
+      - '(?i)(pip[^\n]*--trusted-host|npm[^\n]*--no-audit[^\n]*--no-fund)'
+      - '(?i)apt-get[^\n]*--allow-insecure-repositories'
+      - '(?i)gpgcheck\s*=\s*0'
+    question: >
+      What check is being turned off, and what problem was it blocking?
+    guidance: |
+      These flags almost always appear to work around a broken proxy, an expired
+      certificate or an internal mirror without signatures. Fix the underlying
+      cause: the flag persists long after the incident that motivated it, and it
+      silently disables the one control that would catch a tampered package.
+    cwe: ["CWE-494"]
+
+  - id: supplychain.vendored-binary-added
+    title: Binary or archive committed to the repository
+    category: supply-chain
+    severity: medium
+    confidence: medium
+    on: file
+    file_events: ["created"]
+    paths:
+      - "**/*.jar"
+      - "**/*.war"
+      - "**/*.dll"
+      - "**/*.so"
+      - "**/*.dylib"
+      - "**/*.exe"
+      - "**/*.bin"
+      - "**/*.wasm"
+      - "**/*.zip"
+      - "**/*.tar.gz"
+      - "**/*.tgz"
+      - "**/*.whl"
+      - "**/*.pyz"
+    question: >
+      Where did this binary come from, and can anyone reproduce it from source?
+    guidance: |
+      A committed binary is a dependency that no scanner will see and no updater
+      will patch. Record its provenance - upstream URL, version, checksum - or
+      better, build it in CI from a pinned source. If it must be vendored, note
+      who is responsible for tracking advisories against it.
+    cwe: ["CWE-1357"]

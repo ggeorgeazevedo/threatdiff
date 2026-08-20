@@ -1,0 +1,150 @@
+version: 1
+name: availability
+description: >
+  Resource exhaustion and the failure modes that turn a bug into an outage.
+
+rules:
+  - id: dos.unbounded-request-body-read
+    title: Request body or upload read without a size limit
+    category: denial-of-service
+    severity: medium
+    confidence: medium
+    on: added
+    patterns:
+      - '(?i)(io\.ReadAll|ioutil\.ReadAll)\s*\(\s*(r|req|request)\.Body'
+      - '(?i)(request|req)\.(data|body|read|get_data)\s*\(\s*\)'
+      - '(?i)\.read\s*\(\s*\)\s*$'
+      - '(?i)(MAX_CONTENT_LENGTH|client_max_body_size|maxFileSize|max_?upload_?size)\s*[:=]\s*(0|None|null|-1)'
+    near:
+      absent:
+        - '(?i)(MaxBytesReader|LimitReader|max_?(content_?length|size|bytes)|client_max_body_size|limit\s*=|chunk)'
+      window: 6
+    question: >
+      What is the largest body a caller can send here, and what happens to memory
+      when they do?
+    guidance: |
+      Set a limit at the edge (reverse proxy) and again in the application, since
+      the edge limit is missing on internal calls. In Go, wrap with
+      `http.MaxBytesReader`; in Flask, set `MAX_CONTENT_LENGTH`; in Express, pass
+      a `limit` to the body parser.
+      Streaming to disk instead of buffering in memory changes the failure from
+      "process dies" to "disk fills", which is usually easier to survive.
+    cwe: ["CWE-770"]
+
+  - id: dos.regex-from-input-or-catastrophic
+    title: Regular expression built from input, or with nested quantifiers
+    category: denial-of-service
+    severity: medium
+    confidence: low
+    on: added
+    languages: [javascript, typescript, python, java, ruby, php, csharp, vue, svelte]
+    exclude_paths:
+      - "**/*.md"
+      - "**/*.rst"
+      - "**/*.adoc"
+    patterns:
+      - '(?i)(new\s+RegExp|re\.compile|Pattern\.compile|Regex\s*\()\s*\(?\s*[a-z_$][\w.]*\s*[,)]'
+      - '\(\s*[^)\n]*[+*]\s*\)\s*[+*]'
+      - '\(\s*[^)|\n]+\|\s*[^)\n]+\s*\)\s*[+*]\s*[$"'']'
+    question: >
+      Can a caller control either the pattern or a long input matched against it?
+    guidance: |
+      Nested quantifiers such as `(a+)+` backtrack exponentially on backtracking
+      engines - which is most of them, excluding Go's RE2 and Rust's regex crate.
+      A 30-character input can pin a CPU core for minutes.
+      Mitigations: use a linear-time engine, set a match timeout (.NET and Java
+      allow this), anchor and bound the pattern, or cap the input length before
+      matching. Never compile a pattern supplied by a caller.
+    cwe: ["CWE-1333"]
+
+  - id: dos.no-timeout-on-outbound-call
+    title: Outbound call or client created without a timeout
+    category: denial-of-service
+    severity: medium
+    confidence: low
+    on: added
+    patterns:
+      - '(?i)(requests\.(get|post|put|delete|head|patch))\s*\([^\n]*\)\s*$'
+      - '(?i)&?http\.Client\s*\{\s*\}'
+      - '(?i)new\s+(HttpClient|OkHttpClient|RestTemplate)\s*\(\s*\)'
+      - '(?i)(fetch|axios)\s*\(\s*[^\n]*\)\s*$'
+    exclude_patterns:
+      - '(?i)(timeout|deadline|AbortController|WithContext|signal\s*:)'
+    question: >
+      What happens to this worker if the remote side accepts the connection and
+      then never responds?
+    guidance: |
+      A missing timeout converts a slow dependency into thread-pool exhaustion and
+      then a full outage, and it is the most common cause of cascading failure in
+      microservice architectures.
+      Set connect and read timeouts explicitly, add a retry budget rather than
+      naive retries, and consider a circuit breaker for anything on the request
+      path.
+    cwe: ["CWE-1088"]
+
+  - id: dos.archive-extraction
+    title: Archive extracted without path or size checks
+    category: denial-of-service
+    severity: high
+    confidence: medium
+    on: added
+    patterns:
+      - '(?i)(zipfile\.ZipFile|tarfile\.open|extractall|ZipInputStream|TarArchiveInputStream|unzip|AdmZip|extract\s*\()'
+      - '(?i)shutil\.unpack_archive'
+    exclude_patterns:
+      - '(?i)(filter\s*=\s*["'']data["'']|is_?safe_?path|resolve\(\)\.startswith|commonpath|max_?size)'
+    question: >
+      Can an entry in this archive escape the target directory, or expand to far
+      more than it claims?
+    guidance: |
+      Two separate problems. Zip Slip: an entry named `../../etc/cron.d/x`
+      overwrites files outside the extraction root - resolve each entry path and
+      verify it stays inside the root before writing.
+      Zip bombs: check the declared uncompressed size, cap the total bytes
+      written, and cap the number of entries. Python 3.12+ offers
+      `tarfile.extractall(filter="data")`, which handles the traversal half.
+    cwe: ["CWE-22", "CWE-409"]
+
+  - id: dos.resource-limits-removed
+    title: Container resource limits or replica floor removed
+    category: denial-of-service
+    severity: medium
+    confidence: medium
+    on: removed
+    languages: [yaml, compose, terraform, hcl, json]
+    patterns:
+      - '(?i)^\s*(limits|resources|cpu|memory|ephemeral-storage)\s*:'
+      - '(?i)(replicas|min_?replicas|minReplicas|desired_?count)\s*[:=]\s*\d+'
+      - '(?i)(pod_?disruption_?budget|PodDisruptionBudget|liveness_?probe|readiness_?probe)'
+    question: >
+      Which workload can now consume the whole node, and what else runs on it?
+    guidance: |
+      Without limits, one workload's memory leak evicts its neighbours. Without a
+      readiness probe, traffic reaches instances that are not ready. Both look
+      like unrelated incidents later.
+      If the limits were removed because the workload was being throttled, the
+      answer is usually a higher limit plus a right-sized request, not no limit.
+    cwe: ["CWE-770"]
+
+  - id: dos.retry-without-backoff
+    title: Retry loop without backoff or a cap
+    category: denial-of-service
+    severity: low
+    confidence: low
+    on: added
+    patterns:
+      - '(?i)(while\s*\(?\s*(true|True|1)\s*\)?|for\s*\(\s*;;\s*\))'
+      - '(?i)(retry|retries)\s*[:=]\s*(-1|999|math\.inf|Infinity)'
+      - '(?i)@retry\s*\(\s*\)'
+    near:
+      absent:
+        - '(?i)(backoff|jitter|sleep|delay|max_?(retries|attempts)|break|ctx\.Done)'
+      window: 6
+    question: >
+      If the dependency is down, does this loop make the outage worse?
+    guidance: |
+      Uncapped retries create a retry storm: the moment the dependency starts
+      recovering, it is hit by every client's accumulated backlog at once and
+      falls over again. Exponential backoff with jitter and a total attempt
+      budget is the standard fix.
+    cwe: ["CWE-834"]

@@ -1,0 +1,306 @@
+version: 1
+name: injection
+description: >
+  Untrusted data reaching an interpreter: SQL, shell, templates, deserializers,
+  XML parsers and the DOM.
+
+rules:
+  - id: injection.sql-string-building
+    title: SQL statement built by string concatenation or interpolation
+    category: tampering
+    severity: critical
+    confidence: medium
+    on: added
+    exclude_paths:
+      - "**/*.md"
+      - "**/*.rst"
+      - "**/*.adoc"
+      - "**/test/**"
+      - "**/tests/**"
+      - "**/migrations/**"
+    patterns:
+      - '(?i)(select|insert|update|delete|drop|alter|truncate|union)\b[^\n]*\b(from|into|set|table|where)\b[^\n]*(\+\s*[a-z_$]|\$\{|%s["'']?\s*%|\.format\s*\(|f["'']|\|\|\s*[a-z_$]|#\{|<%=)'
+      - '(?i)(execute|exec|query|raw|rawquery|from_?sql|db\.(query|exec)|cursor\.execute)\s*\(\s*(f["'']|["''][^"'']*["'']\s*\+|`[^`]*\$\{)'
+      - '(?i)\.(raw|rawSql|literal|unsafe)\s*\(\s*[^)]*(\+|\$\{|%s|format)'
+    exclude_patterns:
+      - '(?i)\?\s*,|:\w+\s*[,)]|\$\d+'
+    question: >
+      Is every value in this statement bound as a parameter, or is any of it
+      concatenated from caller-controlled input?
+    guidance: |
+      Parameter binding is the answer for values. If the variable part is an
+      identifier (a table or column name) or a sort direction, binding does not
+      apply - use an allow-list mapping from input to a fixed set of known-good
+      identifiers, never the raw string.
+      Look past the obvious: ORDER BY, LIMIT, IN-clause expansion, and dynamic
+      WHERE builders are where injection survives in codebases that otherwise
+      use an ORM.
+    cwe: ["CWE-89"]
+    owasp: ["A03:2021 Injection"]
+
+  - id: injection.os-command
+    title: Shell or process execution with a constructed command line
+    category: tampering
+    severity: critical
+    confidence: medium
+    on: added
+    exclude_paths:
+      - "**/*.md"
+      - "**/*.rst"
+      - "**/*.adoc"
+    patterns:
+      - '(?i)(os\.system|os\.popen|subprocess\.(call|run|Popen|check_output|check_call)|commands\.getoutput)\s*\('
+      - '(?i)(child_process\.)?(exec|execSync|spawnSync|spawn)\s*\(\s*(`|["''][^"'']*["'']\s*\+|.*\$\{)'
+      - '(?i)exec\.Command\s*\(\s*["''](sh|bash|cmd|powershell|/bin/sh)["'']'
+      - '(?i)Runtime\.getRuntime\(\)\.exec\s*\('
+      - '(?i)(shell_exec|passthru|proc_open|popen|system)\s*\('
+      - '(?i)`[^`\n]*\$\{[^`\n]*`\s*$'
+    exclude_patterns:
+      - '(?i)shell\s*=\s*False'
+    question: >
+      Can any part of this command line be influenced by data that crossed a
+      trust boundary?
+    guidance: |
+      Prefer the argument-vector form over a shell string: `subprocess.run([...],
+      shell=False)`, `execFile`, `exec.Command("prog", arg)`. That removes the
+      shell metacharacter problem entirely.
+      If a shell is genuinely required, remember that quoting helpers protect
+      arguments but not options: a filename beginning with `-` can still turn
+      into a flag. Terminate options with `--` and validate the argument shape.
+    cwe: ["CWE-78"]
+    owasp: ["A03:2021 Injection"]
+
+  - id: injection.dynamic-code-evaluation
+    title: Dynamic code evaluation introduced
+    category: tampering
+    severity: critical
+    confidence: high
+    on: added
+    exclude_paths:
+      - "**/*.md"
+      - "**/*.rst"
+      - "**/*.adoc"
+      - "**/test/**"
+      - "**/tests/**"
+    patterns:
+      - '(?i)\b(eval|exec)\s*\('
+      - '(?i)new\s+Function\s*\('
+      - '(?i)setTimeout\s*\(\s*["'']'
+      - '(?i)(vm\.runIn(New|This)Context|Function\s*\(\s*["''])'
+      - '(?i)(^|[^.\w])(execfile|__import__)\s*\('
+      - '(?i)ScriptEngineManager|Nashorn|GroovyShell|Class\.forName\s*\('
+    question: >
+      Where does the evaluated string come from, and can any of it be attacker
+      controlled?
+    guidance: |
+      Dynamic evaluation with a fully static string is a code-smell but not a
+      vulnerability; with any dynamic component it is remote code execution.
+      Common safe replacements: a lookup table of functions instead of
+      `eval(name)`, `JSON.parse` instead of `eval` for data, and a sandboxed
+      expression library with an allow-list of operations for user formulas.
+    cwe: ["CWE-95", "CWE-94"]
+
+  - id: injection.unsafe-deserialization
+    title: Unsafe deserialization of external data
+    category: tampering
+    severity: critical
+    confidence: high
+    on: added
+    exclude_paths:
+      - "**/*.md"
+      - "**/*.rst"
+      - "**/*.adoc"
+    patterns:
+      - '(?i)pickle\.(load|loads)|cPickle\.|dill\.loads|joblib\.load'
+      - '(?i)yaml\.(load|unsafe_load|full_load)\s*\('
+      - '(?i)(ObjectInputStream|readObject\s*\(|XMLDecoder|XStream\s*\(\s*\))'
+      - '(?i)\bunserialize\s*\('
+      - '(?i)Marshal\.load|YAML\.(load|unsafe_load)\s*\('
+      - '(?i)BinaryFormatter|NetDataContractSerializer|LosFormatter|TypeNameHandling\s*[:=]\s*(TypeNameHandling\.)?(All|Objects|Auto)'
+      - '(?i)torch\.load\s*\('
+    exclude_patterns:
+      - '(?i)yaml\.(safe_load|load)\s*\([^\n]*(SafeLoader|CSafeLoader)'
+      - '(?i)weights_only\s*=\s*True'
+    question: >
+      Does the serialized data ever originate outside your trust boundary,
+      including from a cache, a queue or a file upload?
+    guidance: |
+      Object deserializers reconstruct arbitrary types and run their
+      constructors, which is why they turn into RCE so reliably. Replace with a
+      data-only format: JSON, `yaml.safe_load`, protobuf, or an explicit
+      allow-list of deserializable classes.
+      "It comes from our own Redis" is not a trust boundary argument if anything
+      untrusted can write to that Redis, and a compromised cache is a common
+      second stage.
+    cwe: ["CWE-502"]
+    owasp: ["A08:2021 Software and Data Integrity Failures"]
+
+  - id: injection.server-side-template
+    title: Template rendered from a dynamically built string
+    category: tampering
+    severity: high
+    confidence: medium
+    on: added
+    patterns:
+      - '(?i)render_template_string\s*\('
+      - '(?i)(Template|Environment)\s*\(\s*[^)]*\$\{|Template\s*\(\s*\w+\s*\)\s*\.\s*render'
+      - '(?i)(jinja2\.Template|Handlebars\.compile|_\.template|ejs\.render|pug\.compile)\s*\(\s*[a-z_$]'
+      - '(?i)freemarker|velocity[^\n]*evaluate\s*\('
+    question: >
+      Is the template itself built from input, or only the values passed into it?
+    guidance: |
+      Passing user data as a template *variable* is fine. Building the template
+      *source* from user data gives the attacker the template language, which in
+      most engines reaches the runtime and therefore the shell. Keep templates as
+      static files or a fixed registry.
+    cwe: ["CWE-1336"]
+
+  - id: injection.xss-raw-html-sink
+    title: Raw HTML written to the DOM or marked safe
+    category: tampering
+    severity: high
+    confidence: medium
+    on: added
+    languages: [javascript, typescript, vue, svelte, html, python, ruby, php, java, csharp]
+    exclude_paths:
+      - "**/*.md"
+      - "**/*.rst"
+      - "**/*.adoc"
+    patterns:
+      - '(?i)dangerouslySetInnerHTML|v-html\s*=|\{\{\{|innerHTML\s*=|outerHTML\s*=|insertAdjacentHTML\s*\('
+      - '(?i)document\.write(ln)?\s*\('
+      - '(?i)(mark_?safe|safe_?join|\|\s*safe\b|html_safe|raw\s*\(|HtmlString|Html\.Raw)\b'
+      - '(?i)\$\s*\(\s*[^)]*\)\.(html|append|prepend|after|before)\s*\(\s*[a-z_$]'
+    exclude_patterns:
+      - '(?i)(DOMPurify|sanitize[Hh]tml|bleach\.clean|purify)'
+    question: >
+      Is the value written here already sanitised, and by a library rather than a
+      hand-rolled escape?
+    guidance: |
+      Prefer `textContent` when the value is not meant to be markup. When markup
+      is required, sanitise with a maintained library (DOMPurify, bleach,
+      OWASP Java HTML Sanitizer) configured with an allow-list, and do it as
+      close to the sink as possible so a later refactor cannot separate the two.
+      Escaping by hand with a few `replace` calls does not survive contact with
+      attribute contexts, `javascript:` URLs or SVG.
+    cwe: ["CWE-79"]
+    owasp: ["A03:2021 Injection"]
+
+  - id: injection.xxe-external-entities
+    title: XML parser configured without external entity protection
+    category: information-disclosure
+    severity: high
+    confidence: medium
+    on: added
+    patterns:
+      - '(?i)(DocumentBuilderFactory|SAXParserFactory|XMLInputFactory|TransformerFactory)\.newInstance\s*\('
+      - '(?i)(etree\.XMLParser|lxml\.etree\.(parse|fromstring)|xml\.dom\.minidom|xmlrpc)'
+      - '(?i)resolve_?entities\s*[:=]\s*(true|True)'
+      - '(?i)(libxml_disable_entity_loader\s*\(\s*false|LIBXML_NOENT)'
+      - '(?i)XmlReaderSettings[^\n]*DtdProcessing\s*=\s*DtdProcessing\.Parse'
+    exclude_patterns:
+      - '(?i)(disallow-doctype-decl|external-general-entities|setFeature[^\n]*false|defusedxml|resolve_entities\s*=\s*False|XMLConstants\.FEATURE_SECURE_PROCESSING)'
+    question: >
+      Does this parser process DOCTYPE declarations and external entities from
+      documents you did not author?
+    guidance: |
+      Disable DTDs entirely where you can - that is the only setting that closes
+      XXE, billion-laughs and external-DTD SSRF at once. In Java, set
+      `disallow-doctype-decl` to true. In Python, use `defusedxml`. In .NET set
+      `DtdProcessing = Prohibit`. Also check any SOAP, SVG, DOCX/XLSX or SAML
+      handling nearby: those are XML too, and SAML in particular is parsed before
+      the caller is authenticated.
+    cwe: ["CWE-611"]
+
+  - id: injection.ssrf-request-from-input
+    title: Outbound request to a URL derived from input
+    category: information-disclosure
+    severity: high
+    confidence: low
+    on: added
+    patterns:
+      - '(?i)(requests\.(get|post|put|head)|httpx\.|urllib\.request\.urlopen|http\.(Get|Post)|axios\.(get|post)|fetch\s*\(|HttpClient|RestTemplate|curl_setopt|file_get_contents|WebClient)\s*\(?[^\n]*(url|uri|endpoint|host|target|link|callback|webhook|redirect|image_?url|avatar|src)'
+    near:
+      absent:
+        - '(?i)(allow_?list|allowlist|whitelist|is_?allowed|validate_?url|parse_?url[^\n]*host\s*(in|==)|deny_?list|blocklist|SSRF)'
+      window: 8
+    question: >
+      Can the caller point this request at your internal network, cloud metadata
+      service, or localhost?
+    guidance: |
+      SSRF defence is an allow-list of destination hosts, resolved and checked
+      *after* DNS resolution, with redirects disabled or re-validated at every
+      hop. Blocking `169.254.169.254` and `127.0.0.1` by string match is
+      defeated by DNS rebinding, decimal IPs, IPv6-mapped addresses and
+      redirects.
+      Webhooks, "import from URL", avatar fetching, PDF/screenshot rendering and
+      link unfurling are the features where this shows up.
+    cwe: ["CWE-918"]
+    owasp: ["A10:2021 Server-Side Request Forgery"]
+
+  - id: injection.path-traversal
+    title: File path built from input
+    category: information-disclosure
+    severity: high
+    confidence: low
+    on: added
+    patterns:
+      - '(?i)(open|readfile|read_file|writefile|sendfile|send_file|os\.path\.join|path\.join|filepath\.Join|File\s*\(|FileInputStream|new\s+File)\s*\([^\n]*(request|params|req\.|query|args|body|input|filename|user_?input|upload)'
+      - '(?i)(static|download|attachment)[^\n]*(filename|path)\s*[:=][^\n]*(request|params|query|body)'
+    near:
+      absent:
+        - '(?i)(secure_?filename|sanitize_?path|basename|filepath\.Clean|path\.resolve[^\n]*startsWith|is_?safe_?path|allow_?list)'
+      window: 6
+    question: >
+      Can the input escape the intended directory with `..`, an absolute path, or
+      a symlink?
+    guidance: |
+      Resolve the final path and verify it is still inside the intended root
+      *after* normalisation, then open it. Checking the raw string for `..`
+      before normalising misses URL-encoded, double-encoded and Unicode variants,
+      and misses symlinks entirely.
+      Where possible do not accept a path at all: accept an identifier and look
+      the real path up in a table you control.
+    cwe: ["CWE-22"]
+
+  - id: injection.nosql-operator
+    title: NoSQL query built from a raw request object
+    category: tampering
+    severity: high
+    confidence: medium
+    on: added
+    patterns:
+      - '(?i)\$where\s*[:=]'
+      - '(?i)(find|findOne|update|deleteOne|deleteMany|aggregate)\s*\(\s*(req\.(body|query|params)|request\.(json|args|form))\s*\)'
+      - '(?i)(find|findOne)\s*\(\s*\{[^\n]*:\s*req\.(body|query|params)'
+    question: >
+      Could the caller supply an object where you expected a string, turning the
+      value into a query operator?
+    guidance: |
+      `{"password": {"$ne": null}}` is the canonical NoSQL authentication bypass
+      and it needs nothing more than a JSON body where a string was assumed.
+      Coerce types explicitly (`String(req.body.user)`), validate the request
+      against a schema before it reaches the query, and never pass a request
+      object straight through.
+    cwe: ["CWE-943"]
+
+  - id: injection.ldap-or-header
+    title: LDAP filter or HTTP header built from input
+    category: tampering
+    severity: medium
+    confidence: medium
+    on: added
+    patterns:
+      - '(?i)(search|bind|ldap_search)\s*\([^\n]*\(\s*(uid|cn|sAMAccountName)\s*=\s*[^)\n]*(\+|\$\{|%s|format)'
+      - '(?i)(setHeader|set_header|add_header|addHeader|headers\[)\s*[^\n]*(\+\s*[a-z_$]|\$\{|%s|format)[^\n]*'
+    exclude_patterns:
+      - '(?i)(escape_?filter|ldap\.filter\.escape|encodeForLDAP)'
+    question: >
+      Are control characters (parentheses for LDAP, CR/LF for headers) removed
+      from the interpolated value?
+    guidance: |
+      For LDAP, use the platform filter-escaping helper rather than manual
+      quoting. For headers, a newline in a value is response splitting: most
+      modern frameworks reject it, but string-built raw responses, proxies and
+      redirect Location headers still get caught by it.
+    cwe: ["CWE-90", "CWE-113"]

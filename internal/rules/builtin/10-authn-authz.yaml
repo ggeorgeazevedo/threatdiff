@@ -1,0 +1,252 @@
+version: 1
+name: authn-authz
+description: >
+  Identity, session and access-control changes introduced by a diff.
+
+rules:
+  - id: authz.new-endpoint-without-auth
+    title: New route handler with no visible authorization nearby
+    category: elevation-of-privilege
+    severity: high
+    confidence: low
+    on: added
+    exclude_paths:
+      - "**/test/**"
+      - "**/tests/**"
+      - "**/*.test.*"
+      - "**/*.spec.*"
+      - "**/docs/**"
+    patterns:
+      - '(?i)^\s*@(app|router|api|bp|blueprint|[a-z_]+)\.(get|post|put|patch|delete|route)\s*\('
+      - '(?i)^\s*(app|router|api|r|mux|srv)\.(Get|Post|Put|Patch|Delete|Handle|HandleFunc|route|all)\s*\(\s*["`'']'
+      - '(?i)^\s*(get|post|put|patch|delete|resources?)\s+["'':/][^\n]*(=>|,\s*to:|do\b)'
+      - '(?i)^\s*\[(HttpGet|HttpPost|HttpPut|HttpPatch|HttpDelete|Route)\s*\('
+      - '(?i)^\s*@(GetMapping|PostMapping|PutMapping|PatchMapping|DeleteMapping|RequestMapping)\s*\('
+    near:
+      absent:
+        - '(?i)(auth|authoriz|authenticat|permission|require[_\-]?(login|role|scope)|current_?user|principal|jwt|session|token|acl|rbac|guard|policy|can\(|ability|is_?admin|scope)'
+      window: 10
+      scope: hunk
+    question: >
+      Who is allowed to call this endpoint, and where is that decision made?
+    guidance: |
+      Say the answer out loud in the PR: "anyone on the internet", "any logged-in
+      user", or "members of tenant X with role Y". If the answer is anything
+      other than the first, point at the code that enforces it. If enforcement
+      lives in a router-level middleware outside this hunk, say so - that is a
+      perfectly good answer and closes the finding.
+      Pay particular attention to object ownership: `GET /invoices/:id` that
+      checks only "is logged in" is the classic IDOR.
+    cwe: ["CWE-862", "CWE-639"]
+    owasp: ["A01:2021 Broken Access Control"]
+
+  - id: authz.object-lookup-from-request-id
+    title: Object fetched directly by a request-supplied identifier
+    category: elevation-of-privilege
+    severity: high
+    confidence: low
+    on: added
+    exclude_paths:
+      - "**/test/**"
+      - "**/tests/**"
+    patterns:
+      - '(?i)(find_?by_?id|findbyid|findone|get_?object_?or_?404|\.get\s*\(\s*(pk|id)\s*=|queryset\.get|\.first\s*\(\s*\)|SELECT[^\n]*WHERE[^\n]*\bid\s*=)[^\n]*(params|request|req\.|body|query|args|input|payload)'
+      - '(?i)(params|req\.params|request\.args|request\.query|body)\s*(\[|\.)\s*["'']?(id|uuid|user_?id|account_?id|org_?id|tenant_?id)'
+    near:
+      absent:
+        - '(?i)(current_?user|owner|tenant|scope|belongs_?to|authoriz|permission|can\(|filter\s*\(\s*user|where.*user_?id|account_?id\s*==)'
+      window: 8
+    question: >
+      Does the query constrain the object to the caller's tenant, account or
+      ownership, or only to the identifier they supplied?
+    guidance: |
+      The fix is nearly always to scope the query rather than to check after
+      loading: `Invoice.where(account: current_user.account).find(params[:id])`
+      instead of `Invoice.find(params[:id])` followed by a comparison. Scoping
+      also removes the 404-vs-403 oracle that tells an attacker which
+      identifiers exist.
+    cwe: ["CWE-639"]
+    owasp: ["A01:2021 Broken Access Control"]
+
+  - id: authn.jwt-verification-disabled
+    title: JWT signature verification disabled or weakened
+    category: spoofing
+    severity: critical
+    confidence: high
+    on: added
+    patterns:
+      - '(?i)verify_?signature\s*[:=]\s*(false|False|0)'
+      - '(?i)jwt\.(decode|verify)\s*\([^\n]*verify\s*[:=]\s*(false|False)'
+      - '(?i)algorithms?\s*[:=]\s*\[?\s*["'']?none["'']?'
+      - '(?i)(decode|parse)[^\n]*\bnoVerify\b'
+      - '(?i)jwt\.decode\s*\([^,\n]+\)\s*$'
+      - '(?i)parseClaimsJwt|setSigningKeyResolver\s*\(\s*null'
+    question: >
+      Can a caller now present a token they minted themselves and be believed?
+    guidance: |
+      Unverified decoding is legitimate in exactly one situation: reading a
+      non-security claim (like `kid` or `iss`) in order to *select* the key that
+      will then verify the token. Confirm a verification step follows. Also check
+      that the accepted algorithm list is fixed on the server side - accepting
+      the algorithm named in the token's own header is how `alg: none` and
+      RS256-to-HS256 confusion happen.
+    cwe: ["CWE-347"]
+    owasp: ["A02:2021 Cryptographic Failures"]
+    references:
+      - "https://cwe.mitre.org/data/definitions/347.html"
+
+  - id: authn.password-comparison-not-constant-time
+    title: Secret compared with a plain equality operator
+    category: spoofing
+    severity: medium
+    confidence: medium
+    on: added
+    exclude_paths:
+      - "**/*.md"
+      - "**/*.rst"
+      - "**/*.adoc"
+    patterns:
+      - '(?i)(password|passwd|secret|token|api_?key|signature|hmac|digest|otp|mfa_?code)\w*\s*(==|!=|===|!==)\s*'
+      - '(?i)\.equals\s*\(\s*\w*(password|secret|token|signature|hmac)'
+    exclude_patterns:
+      - '(?i)(is\s+None|==\s*null|===\s*undefined|!=\s*None|==\s*""|===\s*"")'
+    question: >
+      Is this comparison timing-safe, and is it comparing a hash rather than a
+      raw secret?
+    guidance: |
+      Use the platform's constant-time comparison: `hmac.compare_digest`,
+      `crypto.timingSafeEqual`, `subtle.ConstantTimeCompare`,
+      `MessageDigest.isEqual`. Timing attacks on a network path are hard but not
+      theoretical, and the fix costs nothing. The larger issue is often what is
+      being compared: raw passwords should never be compared at all, only
+      verified against a slow hash.
+    cwe: ["CWE-208", "CWE-916"]
+
+  - id: authn.session-cookie-flags-weakened
+    title: Session cookie security attributes weakened
+    category: spoofing
+    severity: high
+    confidence: high
+    on: added
+    patterns:
+      - '(?i)http_?only\s*[:=]\s*(false|False|0)'
+      - '(?i)\bsecure\s*[:=]\s*(false|False|0)'
+      - '(?i)same_?site\s*[:=]\s*["'']?(none|None)["'']?'
+      - '(?i)SESSION_COOKIE_(SECURE|HTTPONLY)\s*=\s*False'
+      - '(?i)cookie[^\n]*domain\s*[:=]\s*["'']?\.'
+    question: >
+      Which of the three cookie protections is lost, and what does that enable?
+    guidance: |
+      HttpOnly=false hands the session to any XSS. Secure=false lets a network
+      attacker strip TLS and read it. SameSite=None re-enables cross-site
+      submission, which needs a CSRF token to compensate. A wildcard cookie
+      domain shares the session with every subdomain, including the one running
+      the marketing team's third-party widget.
+    cwe: ["CWE-1004", "CWE-614"]
+
+  - id: authn.mfa-or-verification-bypass
+    title: Multi-factor or account verification step made optional
+    category: spoofing
+    severity: high
+    confidence: medium
+    on: any
+    patterns:
+      - '(?i)(mfa|2fa|two_?factor|otp|totp|email_?verif\w*|phone_?verif\w*|kyc)\w*\s*[:=]\s*(false|False|0|None|null|off|"disabled")'
+      - '(?i)(skip|bypass|ignore)_?(mfa|2fa|otp|verification|challenge)'
+    question: >
+      Under which conditions can the second factor now be skipped, and can a
+      caller reach those conditions on their own?
+    guidance: |
+      MFA bypasses are usually introduced as an escape hatch for support or for
+      a legacy client. Check who can select that path. A parameter such as
+      `skip_mfa=true` accepted from the request body, or a "trusted device"
+      cookie with no server-side binding, turns the escape hatch into the front
+      door.
+    cwe: ["CWE-304"]
+
+  - id: authz.wildcard-permission-grant
+    title: Wildcard or catch-all permission granted
+    category: elevation-of-privilege
+    severity: high
+    confidence: medium
+    on: added
+    patterns:
+      - '(?i)(permissions?|scopes?|roles?|actions?|privileges?)\s*[:=]\s*\[?\s*["'']\*["'']'
+      - '(?i)(allow|grant)\s*[:=]\s*["'']?(all|any|\*)["'']?\s*$'
+      - '(?i)(is_?admin|is_?superuser|is_?staff|role)\s*[:=]\s*(true|True|["'']admin["'']|["'']superuser["''])'
+    question: >
+      Which specific capabilities does this wildcard actually need, and what else
+      does it now include?
+    guidance: |
+      Enumerate what `*` resolves to today, then remember it also covers every
+      permission added in the future by someone who has never heard of this
+      grant. Replace with the explicit list where possible, or at least scope the
+      wildcard to a resource prefix.
+    cwe: ["CWE-269"]
+
+  - id: authn.default-or-hardcoded-credentials
+    title: Default or hardcoded credential introduced
+    category: spoofing
+    severity: critical
+    confidence: medium
+    on: added
+    redact: true
+    exclude_paths:
+      - "**/test/**"
+      - "**/tests/**"
+      - "**/*.test.*"
+      - "**/*.spec.*"
+      - "**/fixtures/**"
+      - "**/*example*"
+    patterns:
+      - '(?i)(user(name)?|login|admin)\s*[:=]\s*["''](admin|root|administrator|sa|test)["'']'
+      - '(?i)(password|passwd|pwd)\s*[:=]\s*["''](admin|password|123456|changeme|secret|letmein|root|test|guest)[a-z0-9!@#$%^&*]*["'']'
+      - '(?i)default_?(password|credential|token|secret)\s*[:=]\s*["''][^"'']+["'']'
+    question: >
+      Does this credential exist in any environment that is reachable from
+      outside a laptop?
+    guidance: |
+      Default credentials are found by scanners within hours of exposure. If this
+      is a bootstrap value, ensure the first-run flow forces a change and that
+      the service refuses to start with the default in a non-development profile.
+    cwe: ["CWE-798", "CWE-1392"]
+
+  - id: authn.auth-bypass-conditional
+    title: Conditional that short-circuits an authentication or authorization check
+    category: elevation-of-privilege
+    severity: high
+    confidence: low
+    on: added
+    patterns:
+      - '(?i)if\s*\(?\s*(is_?(dev|test|local|debug)|env\s*[=!]=\s*["''](dev|development|local|test)|DEBUG|NODE_ENV\s*[=!]=\s*["'']?development)[^\n]*\)?[^\n]*(return\s+(true|True|null|nil)|skip|allow|bypass|next\(\))'
+      - '(?i)(return|=)\s*(true|True)\s*;?\s*(//|#)\s*(TODO|FIXME|temporar|for now|hack)'
+      - '(?i)if\s*\(?\s*[!]\s*(auth|authz|require_?auth|check_?permission)\w*\s*\)?\s*(return|:)\s*'
+    question: >
+      Can the condition that skips the check be reached in production?
+    guidance: |
+      Environment-conditional auth bypasses are a recurring source of incidents
+      because the environment variable is not always what the author assumed:
+      staging built from the production image, a preview deployment, a debug flag
+      left on after an incident. Prefer wiring a real test identity over
+      branching around the check.
+    cwe: ["CWE-489", "CWE-863"]
+
+  - id: authz.tenant-scope-dropped-from-query
+    title: Query filter on tenant, account or owner removed
+    category: elevation-of-privilege
+    severity: critical
+    confidence: low
+    on: removed
+    patterns:
+      - '(?i)(where|filter|scope)[^\n]*(tenant_?id|org(anization)?_?id|account_?id|customer_?id|workspace_?id|owner_?id|user_?id)\s*[=:]'
+      - '(?i)\.(for_?tenant|for_?account|scoped_?to|belonging_?to)\s*\('
+    question: >
+      Does this query still return only rows belonging to the caller's tenant?
+    guidance: |
+      Cross-tenant data leaks are the most expensive class of bug in a
+      multi-tenant product and they look exactly like this in a diff. If the
+      filter moved into a shared scope, a base repository or a row-level security
+      policy, name it. If the query is genuinely global (an admin report, a
+      background aggregation), confirm the caller cannot be an ordinary user.
+    cwe: ["CWE-639", "CWE-566"]
+    owasp: ["A01:2021 Broken Access Control"]

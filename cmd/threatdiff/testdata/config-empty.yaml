@@ -1,0 +1,6 @@
+# An intentionally empty configuration.
+#
+# The CLI tests must not pick up the repository's own .threatdiff.yaml, which
+# sets a gate and disables rules - otherwise the tests would assert on this
+# repository's policy rather than on the tool's behaviour.
+version: 1

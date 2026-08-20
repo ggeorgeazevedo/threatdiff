@@ -1,0 +1,221 @@
+version: 1
+name: crypto
+description: >
+  Cryptographic primitives, transport security and randomness.
+
+rules:
+  - id: crypto.tls-verification-disabled
+    title: TLS certificate verification disabled
+    category: spoofing
+    severity: critical
+    confidence: high
+    on: added
+    exclude_paths:
+      - "**/test/**"
+      - "**/tests/**"
+      - "**/*.test.*"
+      - "**/*.spec.*"
+    patterns:
+      - '(?i)InsecureSkipVerify\s*:\s*true'
+      - '(?i)verify\s*=\s*False'
+      - '(?i)rejectUnauthorized\s*:\s*false'
+      - '(?i)NODE_TLS_REJECT_UNAUTHORIZED\s*[:=]\s*["'']?0'
+      - '(?i)(curl|wget)[^\n]*\s(-k|--insecure|--no-check-certificate)\b'
+      - '(?i)(ssl\._create_unverified_context|CERT_NONE|check_hostname\s*=\s*False)'
+      - '(?i)(ALLOW_ALL_HOSTNAME_VERIFIER|TrustAllCerts|X509TrustManager[^\n]*\{|ServerCertificateValidationCallback\s*[+]?=)'
+      - '(?i)trust[_\-]?all[_\-]?(certs?|certificates?)'
+    question: >
+      Which connection stops being authenticated, and who sits on that network
+      path?
+    guidance: |
+      Disabled verification turns TLS into unauthenticated encryption: an
+      attacker on the path can terminate and re-originate the connection and read
+      or modify everything, credentials included.
+      The legitimate needs behind this flag are almost always solved better by
+      adding the internal CA to the trust store, or by pinning the expected
+      certificate. If this is a genuinely local development shortcut, gate it on
+      an explicit flag that cannot be set in a production configuration.
+    cwe: ["CWE-295"]
+    owasp: ["A02:2021 Cryptographic Failures"]
+
+  - id: crypto.weak-hash-for-security
+    title: Weak hash function used
+    category: tampering
+    severity: high
+    confidence: low
+    on: added
+    exclude_paths:
+      - "**/*.md"
+      - "**/*.rst"
+      - "**/*.adoc"
+    patterns:
+      - '(?i)\b(md5|md4|sha1|sha-1)\b'
+      - '(?i)(MessageDigest\.getInstance|hashlib\.)\s*\(?\s*["'']?(md5|sha1)'
+      - '(?i)crypto\.createHash\s*\(\s*["''](md5|sha1)["'']'
+    exclude_patterns:
+      - '(?i)(etag|cache_?key|checksum|fingerprint|content_?hash|dedup|bucket|shard|gravatar|non_?crypto)'
+    question: >
+      Is this hash used for a security decision, or only as a non-security
+      identifier such as a cache key?
+    guidance: |
+      MD5 and SHA-1 are still fine for cache keys, sharding and change detection
+      of trusted content. They are not fine for signatures, integrity of
+      untrusted data, deduplicating security-relevant artefacts, or anything a
+      collision would let an attacker exploit. SHA-256 costs the same to type.
+      For passwords, no fast hash is appropriate: use argon2id, scrypt or bcrypt.
+    cwe: ["CWE-327", "CWE-328"]
+
+  - id: crypto.password-hashed-with-fast-digest
+    title: Password stored with a general-purpose hash
+    category: information-disclosure
+    severity: critical
+    confidence: medium
+    on: added
+    exclude_paths:
+      - "**/*.md"
+      - "**/*.rst"
+      - "**/*.adoc"
+    patterns:
+      - '(?i)(password|passwd|pwd)\w*\s*=\s*[^\n]*(md5|sha1|sha256|sha512|hashlib\.\w+|createHash)\s*\('
+      - '(?i)(md5|sha1|sha256|sha512)\s*\(\s*\w*(password|passwd|pwd)'
+    question: >
+      What does an offline attacker with the database do with these hashes?
+    guidance: |
+      A GPU tries billions of SHA-256 candidates per second, so a fast hash
+      offers almost no protection once the table leaks. Use argon2id (preferred),
+      scrypt or bcrypt with parameters tuned to take roughly 100ms on your
+      hardware, and store the parameters with the hash so you can raise them
+      later without breaking existing users.
+    cwe: ["CWE-916"]
+    owasp: ["A02:2021 Cryptographic Failures"]
+
+  - id: crypto.weak-cipher-or-mode
+    title: Broken cipher or insecure mode of operation
+    category: information-disclosure
+    severity: high
+    confidence: medium
+    on: added
+    exclude_paths:
+      - "**/*.md"
+      - "**/*.rst"
+      - "**/*.adoc"
+    patterns:
+      - '(?i)\b(des|3des|tripledes|rc4|rc2|blowfish|arcfour)\b'
+      - '(?i)(AES|aes)[/_\-]?(ECB|ecb)'
+      - '(?i)Cipher\.getInstance\s*\(\s*["''][^"'']*ECB'
+      - '(?i)(PKCS1v15|PKCS1_v1_5)\b'
+      - '(?i)(SSLv2|SSLv3|TLSv1(\.0|\.1)?)\b'
+    question: >
+      Is this required by an external protocol you cannot change, or a default
+      that nobody revisited?
+    guidance: |
+      ECB leaks structure - identical plaintext blocks produce identical
+      ciphertext blocks, which is enough to recover meaning without recovering
+      the key. Prefer an AEAD mode: AES-GCM, ChaCha20-Poly1305, or a
+      misuse-resistant construction such as AES-GCM-SIV if nonce management is
+      hard in your context.
+      If a legacy peer forces the weak algorithm, isolate it behind one adapter
+      and document the constraint next to the code.
+    cwe: ["CWE-327"]
+
+  - id: crypto.insecure-randomness
+    title: Non-cryptographic random used where a secret is generated
+    category: spoofing
+    severity: high
+    confidence: medium
+    on: added
+    exclude_paths:
+      - "**/*.md"
+      - "**/*.rst"
+      - "**/*.adoc"
+    patterns:
+      - '(?i)(math/rand|Math\.random|random\.(random|randint|choice|sample|shuffle)|mt_rand|rand\s*\(\s*\)|new\s+Random\s*\(|Random\.next)'
+    near:
+      present:
+        - '(?i)(token|secret|password|key|nonce|salt|otp|session|csrf|reset|invite|verification|api_?key|uuid|id)'
+      window: 4
+    question: >
+      Does an attacker who observes a few of these values gain the ability to
+      predict the next one?
+    guidance: |
+      Mersenne Twister and friends are fully reconstructible from a short run of
+      outputs. Use the OS CSPRNG: `secrets` in Python, `crypto/rand` in Go,
+      `crypto.randomBytes` in Node, `SecureRandom` in Java, `os.urandom`
+      underneath everything.
+      Password-reset tokens, invitation codes, session identifiers and OTPs are
+      the classic victims here.
+    cwe: ["CWE-338"]
+
+  - id: crypto.hardcoded-key-iv-or-salt
+    title: Cryptographic key, IV or salt hardcoded
+    category: information-disclosure
+    severity: critical
+    confidence: medium
+    on: added
+    redact: true
+    exclude_paths:
+      - "**/test/**"
+      - "**/tests/**"
+      - "**/*.test.*"
+      - "**/*.spec.*"
+      - "**/fixtures/**"
+    patterns:
+      - '(?i)(secret_?key|encryption_?key|private_?key|signing_?key|master_?key|hmac_?key|iv|initialization_?vector|salt)\s*[:=]\s*["''][A-Za-z0-9+/=_\-]{8,}["'']'
+      - '(?i)(IV|iv)\s*[:=]\s*(new\s+byte\[\s*\d+\s*\]|b?["'']0{8,}["''])'
+      - '(?i)Key\s*[:=]\s*\[\s*\]byte\s*\(\s*["''][^"'']{8,}["'']'
+    question: >
+      Where does this material come from at deploy time, and how is it rotated?
+    guidance: |
+      A key in the repository is a key in every fork, every CI log and every
+      developer laptop backup. Move it to a secret manager or an environment
+      variable injected at runtime, and treat the committed value as already
+      compromised: rotate it, do not just delete the line.
+      A fixed IV is a separate and equally serious bug: with CTR/GCM it destroys
+      confidentiality outright, since reusing a nonce with the same key leaks the
+      XOR of the plaintexts and, for GCM, the authentication key.
+    cwe: ["CWE-321", "CWE-329"]
+
+  - id: crypto.kdf-parameters-lowered
+    title: Key derivation cost parameters lowered
+    category: information-disclosure
+    severity: high
+    confidence: low
+    on: added
+    patterns:
+      - '(?i)(bcrypt[^\n]*(rounds|cost)\s*[:=]\s*([1-9]|10)\b)'
+      - '(?i)(iterations|rounds|work_?factor|time_?cost|memory_?cost|parallelism)\s*[:=]\s*\d{1,4}\b'
+      - '(?i)PBKDF2[^\n]*,\s*\d{1,5}\s*[,)]'
+    question: >
+      What is the resulting verification time, and was the reduction driven by a
+      measurement or by a timeout?
+    guidance: |
+      Lowering the work factor to fix a slow login makes every stolen hash
+      cheaper to crack forever. If login latency is the problem, look at whether
+      hashing is happening more often than necessary (on every request instead of
+      at session creation) before weakening the parameter.
+      Current rough baselines: bcrypt cost >= 12, PBKDF2-HMAC-SHA256 >= 600k
+      iterations, argon2id with >= 19 MiB memory. Verify against the current
+      OWASP password storage guidance rather than trusting this comment.
+    cwe: ["CWE-916"]
+    references:
+      - "https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html"
+
+  - id: crypto.signature-check-skipped
+    title: Signature or checksum verification result ignored
+    category: tampering
+    severity: critical
+    confidence: medium
+    on: added
+    patterns:
+      - '(?i)(verify|validate|check)_?(signature|sig|hmac|checksum|digest|hash)\w*\s*\([^\n]*\)\s*;?\s*$'
+      - '(?i)_\s*,\s*_\s*=\s*[^\n]*verify'
+      - '(?i)(except|catch)[^\n]*(SignatureError|BadSignature|VerificationError)[^\n]*:?\s*(pass|continue|\{\s*\})'
+      - '(?i)gpg[^\n]*--skip-verify|--no-verify\b|--insecure-skip-tls-verify'
+    question: >
+      Is the boolean or exception from this verification actually acted upon?
+    guidance: |
+      A verification whose result is discarded is worse than no verification,
+      because it creates the belief that the input is trusted. Make the failure
+      path explicit and loud, and make sure the code cannot continue to the
+      "trusted" branch when the check throws.
+    cwe: ["CWE-347", "CWE-354"]

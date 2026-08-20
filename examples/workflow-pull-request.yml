@@ -1,0 +1,60 @@
+# Copy this into .github/workflows/threatdiff.yml in your own repository.
+#
+# Two things to notice:
+#
+#   * The trigger is `pull_request`, not `pull_request_target`. This workflow
+#     never needs secrets beyond the default token, so it should not run with
+#     the base repository's privileges. (threatdiff itself flags the mistake -
+#     see rule ci.pull-request-target-with-head-checkout.)
+#
+#   * `fetch-depth: 0`. The merge base has to exist locally for the diff to be
+#     the one the reviewer sees.
+
+name: threatdiff
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write # to post the review checklist
+  security-events: write # to upload SARIF to code scanning
+
+concurrency:
+  group: threatdiff-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  threat-model:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: threatdiff
+        uses: ggeorgeazevedo/threatdiff@v0 # pin to a SHA in production
+        with:
+          # Start permissive. Turn the gate up once the team has calibrated:
+          #   week 1-2: no fail-on, just the comment
+          #   week 3+:  fail-on: critical
+          #   later:    fail-on: high, with a baseline for the legacy code
+          fail-on: ""
+          comment: "true"
+          sarif: "true"
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always() && steps.threatdiff.outputs.sarif-file != ''
+        with:
+          sarif_file: ${{ steps.threatdiff.outputs.sarif-file }}
+          category: threatdiff
+
+      - name: Label high-risk pull requests
+        if: steps.threatdiff.outputs.band == 'critical' || steps.threatdiff.outputs.band == 'high'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr edit "${{ github.event.pull_request.number }}" --add-label "security-review"

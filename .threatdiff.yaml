@@ -1,0 +1,31 @@
+# threatdiff's own configuration. It runs against its own pull requests - see
+# the `dogfood` job in .github/workflows/ci.yml.
+#
+# A security tool that does not survive its own gate is not one you should ask
+# other people to install.
+version: 1
+
+fail_on: critical
+min_confidence: low
+
+exclude_paths:
+  # The example patch is deliberately full of findings; it is the fixture the
+  # end-to-end tests assert against.
+  - "examples/pull-request.patch"
+  # The rule packs are made of regexes that look exactly like the things they
+  # detect, and the tests are made of fixtures that look exactly like secrets.
+  - "internal/rules/builtin/**"
+  - "**/*_test.go"
+  - "docs/rules.md"
+
+rules:
+  disable:
+    # Our own README and workflow examples quote the insecure patterns they are
+    # warning about; that is the point of them.
+    - ci.remote-script-piped-to-shell
+
+entropy:
+  enabled: true
+  exclude_paths:
+    - "docs/**"
+    - "README.md"

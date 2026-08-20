@@ -1,0 +1,19 @@
+# threatdiff has no Go module dependencies and intends to keep it that way, so
+# the only thing here to update is the actions used by its own workflows -
+# which threatdiff itself asks you to pin to a commit SHA.
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "deps"

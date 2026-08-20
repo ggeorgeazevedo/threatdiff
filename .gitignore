@@ -1,0 +1,7 @@
+/bin/
+/dist/
+*.out
+*.test
+coverage.*
+.threatdiff-report.*
+.DS_Store

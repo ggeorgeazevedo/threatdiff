@@ -1,0 +1,178 @@
+version: 1
+name: data-and-audit
+description: >
+  Data model, migration and accountability changes - the ones that are cheap to
+  review now and expensive to unwind after release.
+
+rules:
+  - id: data.migration-touches-sensitive-column
+    title: Migration touches a security-relevant column
+    category: information-disclosure
+    severity: medium
+    confidence: medium
+    on: added
+    paths:
+      - "**/migrations/**"
+      - "**/migrate/**"
+      - "**/db/migrate/**"
+      - "**/*migration*"
+      - "**/*.sql"
+    patterns:
+      - '(?i)(add_column|alter\s+table|create\s+table|drop\s+column|rename_column)[^\n]*\b(password|hash|salt|token|secret|key|ssn|tax_?id|dob|birth|card|iban|account_?number|mfa|recovery|role|permission|is_?admin|tenant_?id|owner_?id)\b'
+      - '(?i)drop\s+(table|column|index|constraint)'
+      - '(?i)(disable|drop)\s+row\s+level\s+security'
+    question: >
+      Is this migration reversible, and does it change who can read which rows?
+    guidance: |
+      Three things to check: (1) dropping a column destroys data that may be
+      subject to a retention or legal-hold obligation; (2) adding a nullable
+      security column means existing rows default to whatever `NULL` means in
+      your authorization code - often "allowed"; (3) removing a unique constraint
+      or a foreign key can enable duplicate or orphaned records that break tenant
+      isolation.
+      Also confirm the migration will not lock a large table during deploy.
+    cwe: ["CWE-1188"]
+
+  - id: data.pii-field-introduced
+    title: New field that looks like personal or regulated data
+    category: information-disclosure
+    severity: medium
+    confidence: low
+    on: added
+    patterns:
+      - '(?i)\b(ssn|social_?security|tax_?id|passport|national_?id|drivers?_?licen[cs]e|date_?of_?birth|dob|card_?number|pan|cvv|iban|bank_?account|routing_?number|health|diagnosis|biometric|geo_?location|precise_?location)\b\s*[:=]'
+    exclude_paths:
+      - "**/test/**"
+      - "**/tests/**"
+      - "**/*.md"
+    question: >
+      Is this field covered by your data inventory, retention policy and deletion
+      flow?
+    guidance: |
+      New categories of personal data create obligations that outlive the feature:
+      a lawful basis for processing, a retention period, inclusion in export and
+      deletion requests, and possibly a DPIA. The cheapest moment to handle that
+      is now, in this pull request.
+      Card data and health data in particular pull whole compliance regimes
+      (PCI DSS, HIPAA) into scope for whatever system stores them.
+    cwe: ["CWE-359"]
+
+  - id: audit.log-level-or-retention-reduced
+    title: Log level raised or retention shortened
+    category: repudiation
+    severity: medium
+    confidence: medium
+    on: added
+    patterns:
+      - '(?i)(log_?level|logging\.level|LOG_LEVEL)\s*[:=]\s*["'']?(error|fatal|critical|off|none|panic)'
+      - '(?i)(retention|retention_in_days|retention_days|ttl|expire_?after)\s*[:=]\s*([0-9]|1[0-4])\b'
+      - '(?i)(audit|access)_?log\w*\s*[:=]\s*(false|off|disabled|null)'
+    question: >
+      Will you still be able to reconstruct an incident that is discovered a month
+      after it happens?
+    guidance: |
+      Median time to detect an intrusion is measured in weeks, so retention under
+      30 days often means the evidence is gone before anyone looks. Balance the
+      cost by tiering: keep security-relevant events (authentication,
+      authorization decisions, admin actions, data export) longer than debug
+      chatter, rather than shortening everything uniformly.
+    cwe: ["CWE-778"]
+    owasp: ["A09:2021 Security Logging and Monitoring Failures"]
+
+  - id: data.bulk-export-or-admin-endpoint
+    title: Bulk export or administrative operation added
+    category: information-disclosure
+    severity: high
+    confidence: low
+    on: added
+    patterns:
+      - '(?i)(export|download|dump|backup|bulk|batch)_?(all|users|data|records|customers|accounts)\w*\s*\('
+      - '(?i)(route|path|url|mapping)[^\n]*["''][^"'']*/(admin|internal|debug|export|dump|backup|impersonate|sudo|su)\b'
+      - '(?i)(impersonate|switch_?user|become|assume_?identity|login_?as)\s*\('
+    question: >
+      Who can call this, is it rate limited, and does every use leave an audit
+      record naming the operator?
+    guidance: |
+      Bulk export and impersonation are the two features most often abused by an
+      insider or by an attacker who has compromised a support account. They should
+      require elevated authorization, be rate limited independently of normal
+      traffic, and write an audit record that names both the operator and the
+      subject.
+      For impersonation specifically, make the impersonated session visibly
+      marked and time-boxed.
+    cwe: ["CWE-200", "CWE-269"]
+
+  - id: data.deletion-without-safeguards
+    title: Destructive operation without a scope or confirmation
+    category: tampering
+    severity: high
+    confidence: low
+    on: added
+    exclude_paths:
+      - "**/*.md"
+      - "**/*.rst"
+      - "**/*.adoc"
+    patterns:
+      - '(?i)(delete|destroy|drop|truncate|purge|wipe)_?(all|everything)\s*\('
+      - '(?i)DELETE\s+FROM\s+\w+\s*;?\s*$'
+      - '(?i)\.(delete|destroy|remove)\s*\(\s*\)\s*$'
+      - '(?i)rm\s+-rf?\s+[$/]'
+    question: >
+      What is the blast radius if the filter above this line is empty or null?
+    guidance: |
+      `DELETE FROM users` with no `WHERE` is a one-line outage; the same statement
+      with `WHERE tenant_id = NULL` silently matches nothing, which is a different
+      but equally instructive bug.
+      Require an explicit scope, prefer soft deletion for user-visible records,
+      and make destructive administrative operations require a typed confirmation
+      rather than a single click.
+    cwe: ["CWE-284"]
+
+  - id: audit.webhook-or-callback-added
+    title: Inbound webhook or callback endpoint added
+    category: spoofing
+    severity: high
+    confidence: medium
+    on: added
+    patterns:
+      - '(?i)(route|path|mapping|HandleFunc|post)\s*\(?\s*["''][^"'']*/(webhook|callback|hook|notify|events?|ipn|postback)\b'
+      - '(?i)def\s+\w*(webhook|callback)\w*\s*\('
+    near:
+      absent:
+        - '(?i)(signature|hmac|verify|secret|timestamp|svix|stripe_?signature|x-hub-signature|constant_?time)'
+      window: 12
+      scope: file
+    question: >
+      How does this endpoint know the request really came from the provider?
+    guidance: |
+      A webhook URL is effectively public - it appears in logs, proxies and the
+      provider's dashboard. Verify the provider's signature over the raw body
+      (not the parsed JSON), check the timestamp to reject replays, and compare
+      signatures in constant time.
+      Beware of frameworks that consume the body before your handler sees it: the
+      signature is over the exact bytes, so re-serialised JSON will not verify.
+    cwe: ["CWE-345"]
+
+  - id: audit.error-swallowed
+    title: Error or exception silently swallowed
+    category: repudiation
+    severity: low
+    confidence: low
+    on: added
+    patterns:
+      - '(?i)except[^\n]*:\s*(pass|continue)\s*$'
+      - '(?i)catch\s*\([^)]*\)\s*\{\s*\}'
+      - '(?i)catch\s*\([^)]*\)\s*\{\s*//[^\n]*\}'
+      - '(?i)if\s+err\s*!=\s*nil\s*\{\s*\}'
+      - '(?i)_\s*=\s*\w+\.(Close|Write|Verify|Validate)\s*\('
+    exclude_paths:
+      - "**/test/**"
+      - "**/tests/**"
+    question: >
+      Is the swallowed error one that indicates a security control failed?
+    guidance: |
+      An ignored error from a permission check, a signature verification, a token
+      refresh or a write to an audit log converts a hard failure into a silent
+      one. At minimum log it at warning level with enough context to find it
+      later; usually the correct behaviour is to fail closed.
+    cwe: ["CWE-390"]

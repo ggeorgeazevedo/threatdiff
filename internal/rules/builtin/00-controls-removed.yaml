@@ -1,0 +1,263 @@
+version: 1
+name: controls-removed
+description: >
+  Security controls that disappear in a diff. This pack is the reason
+  threatdiff exists: a SAST tool reads the file that results from a change, so
+  a deleted authorization decorator, a removed CSRF guard or a dropped audit
+  log is invisible to it. The deletion is the finding.
+
+rules:
+  - id: control.authz-annotation-removed
+    title: Authorization annotation or decorator removed
+    category: elevation-of-privilege
+    severity: critical
+    confidence: high
+    on: removed
+    exclude_paths:
+      - "**/*_test.go"
+      - "**/test/**"
+      - "**/tests/**"
+      - "**/*.spec.*"
+      - "**/*.test.*"
+    patterns:
+      - '^\s*[@\[]\s*(?i)(login_required|permission_required|permission_classes|user_passes_test|staff_member_required|requires_auth|require_auth|requires_role|authorize|authorized|preauthorize|postauthorize|secured|rolesallowed|denyall|authenticated|admin_required|has_permission|has_role|can_access|before_action\s*:\s*(?i)authenticate)'
+      - '^\s*(?i)before_action\s+:(authenticate|authorize|require_login)'
+    question: >
+      Which endpoints or handlers stop requiring authorization because of this
+      change, and is that intentional?
+    guidance: |
+      Find the function or class the annotation was attached to and answer three
+      questions:
+        1. Is the check now enforced somewhere else (a router-level middleware,
+           a base class, a gateway policy)? Point at the line that does it.
+        2. If it moved, does the new location cover every caller, including
+           internal service-to-service traffic?
+        3. If it was removed on purpose, does the handler still return the same
+           data to an anonymous caller? Confirm with an unauthenticated request.
+    cwe: ["CWE-862", "CWE-863"]
+    owasp: ["A01:2021 Broken Access Control"]
+    references:
+      - "https://owasp.org/Top10/A01_2021-Broken_Access_Control/"
+
+  - id: control.auth-middleware-removed
+    title: Authentication or authorization middleware removed from the request pipeline
+    category: elevation-of-privilege
+    severity: critical
+    confidence: medium
+    on: removed
+    exclude_paths:
+      - "**/test/**"
+      - "**/tests/**"
+      - "**/*.test.*"
+      - "**/*.spec.*"
+    patterns:
+      - '(?i)\.(use|useglobal|addmiddleware|before|wrap)\s*\(\s*[a-z0-9_.]*(auth|authn|authz|jwt|session|passport|oauth|oidc|requirelogin|verifytoken|ensureloggedin|isauthenticated)'
+      - '(?i)(add_middleware|middleware\.append|MIDDLEWARE\s*\+?=)[^\n]*(auth|session|csrf|securit)'
+      - '(?i)(app|router|mux|api)\.(use|middleware)\s*\(\s*(requireauth|authmiddleware|authenticate|authguard)'
+    question: >
+      Is every route that this middleware protected still covered by an
+      equivalent check after the change?
+    guidance: |
+      Middleware removal is rarely local. Enumerate the routes registered on the
+      same router or application object and confirm each one either enforces the
+      check itself or is genuinely public. A quick way to answer this in review:
+      list the routes before and after with your framework's route dumper and
+      diff the two lists together with their guards.
+    cwe: ["CWE-306"]
+    owasp: ["A01:2021 Broken Access Control"]
+
+  - id: control.csrf-protection-removed
+    title: CSRF protection removed or exempted
+    category: spoofing
+    severity: high
+    confidence: high
+    on: any
+    patterns:
+      - '(?i)@?csrf_exempt'
+      - '(?i)csrf\s*[:=]\s*(false|none|off|disabled)'
+      - '(?i)(disable|skip|ignore|exempt)[_\-]?csrf'
+      - '(?i)\[ValidateAntiForgeryToken\]'
+      - '(?i)protect_from_forgery[^\n]*(:?\s*with:\s*:null_session|except)'
+      - '(?i)WTF_CSRF_ENABLED\s*=\s*False'
+    question: >
+      Can this endpoint now be triggered by a cross-site request that carries the
+      victim's session cookie?
+    guidance: |
+      CSRF protection is only safely removable when the endpoint is not
+      cookie-authenticated. Check which credential the endpoint accepts. If it
+      reads a session cookie, the exemption is exploitable unless the cookie is
+      SameSite=Strict/Lax and the request is not a top-level navigation.
+      A bearer token in an Authorization header is not sent cross-site
+      automatically, so an API that only accepts one is genuinely exempt.
+    cwe: ["CWE-352"]
+    owasp: ["A01:2021 Broken Access Control"]
+
+  - id: control.input-validation-removed
+    title: Input validation or sanitisation removed
+    category: tampering
+    severity: high
+    confidence: low
+    on: removed
+    exclude_paths:
+      - "**/test/**"
+      - "**/tests/**"
+      - "**/*.test.*"
+      - "**/*.spec.*"
+    patterns:
+      - '(?i)\b(validate|validator|is_valid|isvalid|sanitize|sanitise|escape_?(html|string|sql)|clean|bleach\.clean|purify|schema\.(parse|validate)|joi\.|zod\.|yup\.|pydantic|marshmallow|assert_valid)\w*\s*\('
+      - '(?i)@(Valid|Validated|NotNull|NotBlank|Size|Pattern|Max|Min)\b'
+    question: >
+      What now reaches the parser, the database or the template that previously
+      could not?
+    guidance: |
+      Trace the value whose validation disappeared to its sinks. If validation
+      moved to a different layer, confirm the new layer runs on every path
+      (including background jobs and admin tooling, which frequently bypass the
+      HTTP handler where validation lives).
+    cwe: ["CWE-20"]
+
+  - id: control.rate-limit-removed
+    title: Rate limiting or throttling removed
+    category: denial-of-service
+    severity: medium
+    confidence: medium
+    on: removed
+    patterns:
+      - '(?i)(rate_?limit|ratelimiter|throttl\w*|@limiter|slowapi|leaky_?bucket|token_?bucket|max_?requests|requests_per)'
+    question: >
+      Which endpoint loses its request ceiling, and what does an attacker gain by
+      calling it in a loop?
+    guidance: |
+      Rate limits protect three different things: cost (a paid downstream API),
+      availability (an expensive query), and credential security (login, OTP,
+      password reset, invite acceptance). Identify which of the three applied
+      here. Authentication endpoints losing a rate limit is a credential-stuffing
+      finding, not a performance one.
+    cwe: ["CWE-770", "CWE-307"]
+
+  - id: control.security-header-removed
+    title: Security response header or hardening middleware removed
+    category: tampering
+    severity: medium
+    confidence: medium
+    on: removed
+    patterns:
+      - '(?i)(content-security-policy|strict-transport-security|x-frame-options|x-content-type-options|referrer-policy|permissions-policy|cross-origin-opener-policy|cross-origin-embedder-policy)'
+      - '(?i)\bhelmet\s*\('
+      - '(?i)SECURE_(HSTS_SECONDS|SSL_REDIRECT|CONTENT_TYPE_NOSNIFF|BROWSER_XSS_FILTER)'
+    question: >
+      Which browser-side protection is lost, and is any user-controlled content
+      rendered by the affected responses?
+    guidance: |
+      Match the header to the attack it prevents: CSP to injected script,
+      X-Frame-Options/frame-ancestors to clickjacking, HSTS to downgrade, and
+      nosniff to content-type confusion on uploads. If the header was removed to
+      unblock a feature, the fix is usually a narrower directive rather than no
+      header.
+    cwe: ["CWE-693"]
+
+  - id: control.audit-log-removed
+    title: Audit or security log statement removed
+    category: repudiation
+    severity: medium
+    confidence: low
+    on: removed
+    exclude_paths:
+      - "**/test/**"
+      - "**/tests/**"
+    patterns:
+      - '(?i)(audit_?log|auditlogger|security_?log|log\.(warn|error|security)|logger\.(warn|error))[^\n]*(login|logout|auth|permission|role|denied|failed|admin|delete|password|token|privilege)'
+      - '(?i)(audit|trail)\.(record|write|emit|log)\s*\('
+    question: >
+      If this action is abused in production, what evidence remains that it
+      happened and who did it?
+    guidance: |
+      Security-relevant events need enough context to answer who, what, when and
+      from where. Check whether an equivalent record still exists downstream (a
+      database trigger, an event bus, the access log). If the log was removed for
+      noise or cost, consider sampling or level changes instead of deletion.
+    cwe: ["CWE-778"]
+
+  - id: control.encryption-removed
+    title: Encryption, hashing or masking of stored data removed
+    category: information-disclosure
+    severity: high
+    confidence: medium
+    on: removed
+    patterns:
+      - '(?i)\b(encrypt|aes|fernet|kms|seal|cipher|encrypted_field|encryptedfield|hash_password|bcrypt|argon2|scrypt|pbkdf2|redact|mask|anonymi[sz]e|tokeni[sz]e)\w*\s*\('
+      - '(?i)(encrypted|encryption)\s*[:=]\s*(true|True|on|enabled)'
+    question: >
+      What data is now written or transmitted in a form that a database dump or
+      log export would reveal?
+    guidance: |
+      Identify the field and its classification. If encryption moved to the
+      storage layer (disk or bucket encryption), note that this protects against
+      a stolen disk but not against an application-level read, a SQL injection
+      or an over-broad support query. Those are usually the threats that
+      motivated field-level encryption in the first place.
+    cwe: ["CWE-311"]
+    owasp: ["A02:2021 Cryptographic Failures"]
+
+  - id: control.security-test-removed
+    title: Security test deleted or skipped
+    category: repudiation
+    severity: medium
+    confidence: medium
+    on: removed
+    paths:
+      - "**/*test*"
+      - "**/*spec*"
+    patterns:
+      - '(?i)(def |func |it\(|test\(|describe\()[^\n]*(auth|authz|permission|forbidden|unauthori[sz]ed|csrf|xss|injection|escalat|tenant|isolation|acl|rbac)'
+      - '(?i)@(skip|Ignore|Disabled|pytest\.mark\.skip)'
+    question: >
+      Was the behaviour this test guarded also removed, or is the guarantee now
+      untested?
+    guidance: |
+      A deleted access-control test with no corresponding change to the control
+      itself is a regression waiting to happen. If the test was flaky, prefer
+      fixing or quarantining it with an owner and a date over deleting it.
+    cwe: ["CWE-1006"]
+
+  - id: control.authz-policy-file-deleted
+    title: Authorization policy file deleted
+    category: elevation-of-privilege
+    severity: high
+    confidence: high
+    on: file
+    file_events: ["deleted"]
+    paths:
+      - "**/*.rego"
+      - "**/*polic*.{yaml,yml,json,hcl}"
+      - "**/*rbac*.{yaml,yml,json}"
+      - "**/casbin*"
+      - "**/*permissions*.{yaml,yml,json}"
+      - "**/CODEOWNERS"
+    question: >
+      Which decisions did this policy make, and what is the default outcome now
+      that it is gone?
+    guidance: |
+      The dangerous case is a policy engine that fails open when no policy
+      matches. Confirm the default decision is deny, and that the deployment
+      pipeline will not simply keep serving the last known policy while everyone
+      believes it was removed.
+    cwe: ["CWE-862"]
+
+  - id: control.feature-flag-security-default-flipped
+    title: Security-relevant feature flag default changed to permissive
+    category: elevation-of-privilege
+    severity: high
+    confidence: low
+    on: added
+    patterns:
+      - '(?i)(enable|require|enforce|strict)[_\-]?(auth|authz|mfa|2fa|tls|ssl|https|verification|validation|signature|encryption|audit)\w*\s*[:=]\s*(false|False|0|"false"|off|disabled)'
+      - '(?i)(disable|skip|bypass|allow)[_\-]?(auth|authz|mfa|2fa|tls|ssl|verification|validation|signature|permission|check)\w*\s*[:=]\s*(true|True|1|"true"|on|enabled)'
+    question: >
+      Is this default shipped to production, and who can flip it at runtime?
+    guidance: |
+      Insecure defaults are the ones that survive. Check whether this value is a
+      local development convenience that leaks into the production config chain,
+      and whether the flag is readable and writable by anyone who should not be
+      able to disable the control.
+    cwe: ["CWE-1188"]

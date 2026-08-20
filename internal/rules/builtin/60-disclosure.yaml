@@ -1,0 +1,183 @@
+version: 1
+name: disclosure
+description: >
+  Data and internal detail escaping to places it should not reach.
+
+rules:
+  - id: disclosure.debug-mode-enabled
+    title: Debug or development mode enabled
+    category: information-disclosure
+    severity: high
+    confidence: high
+    on: added
+    exclude_paths:
+      - "**/test/**"
+      - "**/tests/**"
+      - "**/*.test.*"
+      - "**/*.spec.*"
+    patterns:
+      - '(?i)^\s*DEBUG\s*[:=]\s*(True|true|1)\b'
+      - '(?i)app\.run\s*\([^\n]*debug\s*=\s*True'
+      - '(?i)(FLASK_DEBUG|DJANGO_DEBUG|RAILS_ENV|APP_DEBUG)\s*[:=]\s*["'']?(1|true|development)'
+      - '(?i)(display_errors|expose_php)\s*=\s*On'
+      - '(?i)detailed_?errors?\s*[:=]\s*true|UseDeveloperExceptionPage'
+      - '(?i)ALLOWED_HOSTS\s*=\s*\[\s*["'']\*["'']'
+    question: >
+      Can this configuration reach a deployed environment?
+    guidance: |
+      Debug mode typically exposes stack traces with local variables, framework
+      versions, environment variables and settings. Some frameworks go further:
+      Flask's debugger offers an interactive console, and Django's error page
+      prints the settings module with secrets partially visible.
+      Check the whole configuration chain - a default in code, an env file, a
+      Helm value - not just the line in the diff.
+    cwe: ["CWE-489", "CWE-215"]
+
+  - id: disclosure.cors-permissive
+    title: Permissive CORS configuration
+    category: information-disclosure
+    severity: high
+    confidence: medium
+    on: added
+    patterns:
+      - '(?i)(access-control-allow-origin|allow_?origins?|origin)\s*[:=]\s*\[?\s*["'']\*["'']'
+      - '(?i)allow_?credentials\s*[:=]\s*(true|True)'
+      - '(?i)(CORS|cors)\s*\(\s*\)\s*$'
+      - '(?i)origin\s*:\s*(true|function\s*\([^)]*\)\s*\{\s*(callback|cb)\s*\(\s*null\s*,\s*true)'
+      - '(?i)allow_?origin_?regex\s*[:=]\s*["''][^"'']*\.\*'
+    question: >
+      Which origins are actually allowed, and does the configuration also send
+      credentials?
+    guidance: |
+      A wildcard origin without credentials is usually acceptable for public
+      data. A reflected origin *with* credentials is equivalent to having no
+      same-origin policy at all: any site the victim visits can read authenticated
+      responses.
+      Regex origin matching is a recurring bug source - an unescaped dot or a
+      missing end anchor turns `myapp.com` into a match for
+      `myapp.com.attacker.net`.
+    cwe: ["CWE-942"]
+
+  - id: disclosure.error-details-to-client
+    title: Internal error details returned to the caller
+    category: information-disclosure
+    severity: medium
+    confidence: medium
+    on: added
+    patterns:
+      - '(?i)(res|response|w|ctx)\.(send|json|write|status\(\d+\)\.(send|json))\s*\([^\n]*(err\b|error\b|exception|stack|traceback|e\.message|ex\.ToString)'
+      - '(?i)(jsonify|JsonResponse|render_json)\s*\(\s*\{?[^\n]*(str\(e\)|traceback|repr\(e\))'
+      - '(?i)printStackTrace\s*\(\s*(response|out|writer)'
+    question: >
+      Does the returned message reveal file paths, SQL, library versions or
+      internal hostnames?
+    guidance: |
+      Return a stable error code and a correlation id; log the detail server-side
+      and let support look it up by the id. That keeps debuggability without
+      handing an attacker a free map of your stack.
+      Watch for the subtler variant: different error messages for "user not
+      found" and "wrong password" turn the login endpoint into an account
+      enumeration oracle.
+    cwe: ["CWE-209"]
+
+  - id: disclosure.sensitive-data-in-url
+    title: Sensitive value placed in a URL
+    category: information-disclosure
+    severity: medium
+    confidence: low
+    on: added
+    patterns:
+      - '(?i)[?&](token|access_?token|api_?key|apikey|password|secret|session|auth|jwt|sig|signature)=\{?[a-z_$]'
+      - '(?i)(redirect|url|next|return_?to)\s*[:=][^\n]*[?&](token|key|secret)='
+    question: >
+      Where will this URL be recorded - proxy logs, browser history, the Referer
+      header of the next request?
+    guidance: |
+      Query strings end up in web server logs, CDN logs, analytics and the
+      `Referer` header sent to every third-party resource on the page. Credentials
+      belong in a header or a POST body.
+      Where a URL-borne token is unavoidable (email links, signed downloads), make
+      it single-use, short-lived and scoped to one action.
+    cwe: ["CWE-598"]
+
+  - id: disclosure.open-redirect
+    title: Redirect target taken from input
+    category: spoofing
+    severity: medium
+    confidence: medium
+    on: added
+    patterns:
+      - '(?i)(redirect|sendRedirect|Location|res\.redirect|HttpResponseRedirect|redirect_to)\s*\(?\s*[^\n)]*(request|params|req\.|query|args|body|next|returnUrl|return_?to|callback)'
+    near:
+      absent:
+        - '(?i)(allow_?list|allowlist|whitelist|is_?safe_?url|url_?has_?allowed_?host|startswith\s*\(\s*["'']/|starts_?with\s*\(\s*["'']/)'
+      window: 6
+    question: >
+      Can the destination be an absolute URL on a domain you do not control?
+    guidance: |
+      Prefer accepting a path only, and rejecting anything containing a scheme or
+      a `//` prefix. If full URLs are required, compare against an allow-list of
+      hosts after parsing - not with `startswith`, which `https://yourapp.com.evil.net`
+      satisfies.
+      Open redirects matter most in the OAuth flow and in post-login redirects,
+      where they are used to capture tokens rather than just to phish.
+    cwe: ["CWE-601"]
+
+  - id: disclosure.directory-listing-or-static-root
+    title: Broad static file serving enabled
+    category: information-disclosure
+    severity: medium
+    confidence: medium
+    on: added
+    patterns:
+      - '(?i)(autoindex|directory_?listing|Options\s+\+?Indexes)\s*[:=]?\s*(on|true)?'
+      - '(?i)(static|serve|express\.static|http\.FileServer|StaticFiles)\s*\(\s*["''](\.|/|\./|\.\./)["'']'
+      - '(?i)ServeFile\s*\([^\n]*filepath\.Join'
+    question: >
+      What else is inside the directory being served?
+    guidance: |
+      Serving a repository root or an application directory exposes `.git`,
+      `.env`, backup files, editor swap files and source maps. Serve a dedicated
+      build output directory, and confirm the server refuses dotfiles and
+      resolves symlinks inside the root.
+    cwe: ["CWE-548"]
+
+  - id: disclosure.source-map-or-artifact-shipped
+    title: Source map or build artifact exposed
+    category: information-disclosure
+    severity: low
+    confidence: medium
+    on: added
+    patterns:
+      - '(?i)(sourceMap|devtool)\s*[:=]\s*["'']?(true|source-map|inline-source-map|eval)'
+      - '(?i)GENERATE_SOURCEMAP\s*=\s*true'
+    question: >
+      Is this build going to production, and does the source contain comments,
+      internal endpoints or credentials?
+    guidance: |
+      Source maps are not a vulnerability by themselves; the risk is what your
+      unminified source discloses. Many teams deliberately publish them. Decide
+      consciously, and if you keep them, upload them to your error tracker rather
+      than serving them publicly.
+    cwe: ["CWE-540"]
+
+  - id: disclosure.sensitive-field-added-to-response
+    title: Sensitive field added to a serializer or response model
+    category: information-disclosure
+    severity: high
+    confidence: low
+    on: added
+    patterns:
+      - '(?i)(fields|attributes|columns|select|projection|serializer_fields)\s*[:=]\s*[\[(][^\n]*\b(password|password_hash|salt|token|secret|api_?key|ssn|tax_?id|dob|date_?of_?birth|card|iban|mfa_?secret|recovery_?codes?|internal_?notes?)\b'
+      - '(?i)fields\s*[:=]\s*["'']__all__["'']'
+      - '(?i)(SELECT\s+\*|\.\*)\s+FROM'
+    question: >
+      Does every consumer of this response need every field, and does any of it
+      belong to another user?
+    guidance: |
+      `fields = "__all__"` and `SELECT *` are how internal columns reach an API
+      years after someone added them for an unrelated reason. Enumerate fields
+      explicitly so adding a column is not implicitly a publishing decision.
+      Check nested serializers too - a user object embedded in a comment is the
+      usual route for an email address to become public.
+    cwe: ["CWE-200"]
