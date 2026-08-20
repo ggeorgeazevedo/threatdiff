@@ -8,6 +8,14 @@ on:
 permissions:
   contents: read
 
+# Every runner gets the same shell. Without this, Windows steps run under pwsh,
+# which mangles native-command arguments containing "=" - `-coverprofile=x.out`
+# arrives at go as two arguments and the job fails on a package named ".out".
+# One shell across the matrix also keeps $(...) and [ ] working everywhere.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   test:
     name: test (${{ matrix.os }})
